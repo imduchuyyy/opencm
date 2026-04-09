@@ -1,18 +1,23 @@
 package database
 
-import "time"
+import (
+	"time"
+
+	"github.com/imduchuyyy/opencm/plan"
+)
 
 // GroupConfig holds the AI agent configuration for a specific group
 type GroupConfig struct {
-	ID              int64  `json:"id"`
-	ChatID          int64  `json:"chat_id"` // Telegram chat ID (group/supergroup)
-	SystemPrompt    string `json:"system_prompt"`
-	Bio             string `json:"bio"`
-	Topics          string `json:"topics"`
-	MessageExamples string `json:"message_examples"`
-	ChatStyle       string `json:"chat_style"`
-	Model           string `json:"model"`           // OpenAI model (gpt-4o, etc.)
-	VectorStoreID   string `json:"vector_store_id"` // OpenAI vector store ID for file search
+	ID              int64     `json:"id"`
+	ChatID          int64     `json:"chat_id"` // Telegram chat ID (group/supergroup)
+	Plan            plan.Plan `json:"plan"`    // Subscription tier: free, pro, max
+	SystemPrompt    string    `json:"system_prompt"`
+	Bio             string    `json:"bio"`
+	Topics          string    `json:"topics"`
+	MessageExamples string    `json:"message_examples"`
+	ChatStyle       string    `json:"chat_style"`
+	Model           string    `json:"model"`           // OpenAI model (gpt-4o, etc.)
+	VectorStoreID   string    `json:"vector_store_id"` // OpenAI vector store ID for file search
 	// Permissions
 	CanReply  bool      `json:"can_reply"`
 	CanBan    bool      `json:"can_ban"`

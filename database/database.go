@@ -6,6 +6,8 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/imduchuyyy/opencm/plan"
 )
 
 type DB struct {
@@ -92,12 +94,44 @@ func (db *DB) migrate() error {
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_knowledge_chat ON knowledge(chat_id)`,
+		`CREATE TABLE IF NOT EXISTS group_members (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			chat_id INTEGER NOT NULL,
+			user_id INTEGER NOT NULL,
+			last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(chat_id, user_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id)`,
 	}
 	for _, m := range migrations {
 		if _, err := db.conn.Exec(m); err != nil {
 			return fmt.Errorf("execute migration: %w\nSQL: %s", err, m)
 		}
 	}
+
+	// Additive column migrations (ignore error if column already exists)
+	addColumns := []string{
+		`ALTER TABLE group_configs ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'`,
+	}
+	for _, m := range addColumns {
+		db.conn.Exec(m) // ignore error (column may already exist)
+	}
+
+	// Additional tables that may be added after initial migration
+	additionalTables := []string{
+		`CREATE TABLE IF NOT EXISTS usage_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			chat_id INTEGER NOT NULL,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_logs_chat_month ON usage_logs(chat_id, created_at)`,
+	}
+	for _, m := range additionalTables {
+		if _, err := db.conn.Exec(m); err != nil {
+			return fmt.Errorf("execute migration: %w\nSQL: %s", err, m)
+		}
+	}
+
 	return nil
 }
 
@@ -105,9 +139,10 @@ func (db *DB) migrate() error {
 
 func (db *DB) UpsertGroupConfig(cfg *GroupConfig) error {
 	_, err := db.conn.Exec(
-		`INSERT INTO group_configs (chat_id, system_prompt, bio, topics, message_examples, chat_style, model, vector_store_id, can_reply, can_ban, can_pin, can_poll, can_delete)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO group_configs (chat_id, plan, system_prompt, bio, topics, message_examples, chat_style, model, vector_store_id, can_reply, can_ban, can_pin, can_poll, can_delete)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(chat_id) DO UPDATE SET
+			plan=excluded.plan,
 			system_prompt=excluded.system_prompt,
 			bio=excluded.bio,
 			topics=excluded.topics,
@@ -121,7 +156,7 @@ func (db *DB) UpsertGroupConfig(cfg *GroupConfig) error {
 			can_poll=excluded.can_poll,
 			can_delete=excluded.can_delete,
 			updated_at=CURRENT_TIMESTAMP`,
-		cfg.ChatID, cfg.SystemPrompt, cfg.Bio, cfg.Topics, cfg.MessageExamples, cfg.ChatStyle,
+		cfg.ChatID, string(cfg.Plan), cfg.SystemPrompt, cfg.Bio, cfg.Topics, cfg.MessageExamples, cfg.ChatStyle,
 		cfg.Model, cfg.VectorStoreID,
 		cfg.CanReply, cfg.CanBan, cfg.CanPin, cfg.CanPoll, cfg.CanDelete,
 	)
@@ -130,16 +165,21 @@ func (db *DB) UpsertGroupConfig(cfg *GroupConfig) error {
 
 func (db *DB) GetGroupConfig(chatID int64) (*GroupConfig, error) {
 	cfg := &GroupConfig{}
+	var planStr string
 	err := db.conn.QueryRow(
-		`SELECT id, chat_id, system_prompt, bio, topics, message_examples, chat_style, model, vector_store_id,
+		`SELECT id, chat_id, plan, system_prompt, bio, topics, message_examples, chat_style, model, vector_store_id,
 			can_reply, can_ban, can_pin, can_poll, can_delete, created_at, updated_at
 		 FROM group_configs WHERE chat_id = ?`, chatID,
-	).Scan(&cfg.ID, &cfg.ChatID, &cfg.SystemPrompt, &cfg.Bio, &cfg.Topics, &cfg.MessageExamples, &cfg.ChatStyle,
+	).Scan(&cfg.ID, &cfg.ChatID, &planStr, &cfg.SystemPrompt, &cfg.Bio, &cfg.Topics, &cfg.MessageExamples, &cfg.ChatStyle,
 		&cfg.Model, &cfg.VectorStoreID,
 		&cfg.CanReply, &cfg.CanBan, &cfg.CanPin, &cfg.CanPoll, &cfg.CanDelete,
 		&cfg.CreatedAt, &cfg.UpdatedAt)
 	if err != nil {
 		return nil, err
+	}
+	cfg.Plan = plan.Plan(planStr)
+	if !cfg.Plan.Valid() {
+		cfg.Plan = plan.Free
 	}
 	return cfg, nil
 }
@@ -396,4 +436,87 @@ func (db *DB) GetKnowledge(id int64) (*Knowledge, error) {
 func (db *DB) DeleteKnowledge(id, chatID int64) error {
 	_, err := db.conn.Exec(`DELETE FROM knowledge WHERE id = ? AND chat_id = ?`, id, chatID)
 	return err
+}
+
+// ----- Group Members -----
+
+// UpsertGroupMember records that a user was seen in a group
+func (db *DB) UpsertGroupMember(chatID, userID int64) error {
+	_, err := db.conn.Exec(
+		`INSERT INTO group_members (chat_id, user_id, last_seen_at)
+		 VALUES (?, ?, CURRENT_TIMESTAMP)
+		 ON CONFLICT(chat_id, user_id) DO UPDATE SET last_seen_at=CURRENT_TIMESTAMP`,
+		chatID, userID,
+	)
+	return err
+}
+
+// GetUserGroups returns active groups where the given user has been seen
+func (db *DB) GetUserGroups(userID int64) ([]*Group, error) {
+	rows, err := db.conn.Query(
+		`SELECT g.id, g.chat_id, g.chat_title, g.chat_type, g.is_active, g.joined_at
+		 FROM groups_ g
+		 INNER JOIN group_members gm ON g.chat_id = gm.chat_id
+		 WHERE gm.user_id = ? AND g.is_active = 1
+		 ORDER BY gm.last_seen_at DESC`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []*Group
+	for rows.Next() {
+		g := &Group{}
+		if err := rows.Scan(&g.ID, &g.ChatID, &g.ChatTitle, &g.ChatType, &g.IsActive, &g.JoinedAt); err != nil {
+			return nil, err
+		}
+		groups = append(groups, g)
+	}
+	return groups, nil
+}
+
+// GetGroup returns a single group by chat ID
+func (db *DB) GetGroup(chatID int64) (*Group, error) {
+	g := &Group{}
+	err := db.conn.QueryRow(
+		`SELECT id, chat_id, chat_title, chat_type, is_active, joined_at FROM groups_ WHERE chat_id = ?`, chatID,
+	).Scan(&g.ID, &g.ChatID, &g.ChatTitle, &g.ChatType, &g.IsActive, &g.JoinedAt)
+	if err != nil {
+		return nil, err
+	}
+	return g, nil
+}
+
+// ----- Usage Tracking -----
+
+// LogUsage records one AI response for a group
+func (db *DB) LogUsage(chatID int64) error {
+	_, err := db.conn.Exec(
+		`INSERT INTO usage_logs (chat_id) VALUES (?)`, chatID,
+	)
+	return err
+}
+
+// GetMonthlyUsage returns the number of AI responses for a group in the current calendar month
+func (db *DB) GetMonthlyUsage(chatID int64) (int, error) {
+	var count int
+	err := db.conn.QueryRow(
+		`SELECT COUNT(*) FROM usage_logs
+		 WHERE chat_id = ? AND created_at >= strftime('%Y-%m-01', 'now')`,
+		chatID,
+	).Scan(&count)
+	return count, err
+}
+
+// GetMinuteUsage returns the number of AI responses for a group in the last 60 seconds
+func (db *DB) GetMinuteUsage(chatID int64) (int, error) {
+	var count int
+	err := db.conn.QueryRow(
+		`SELECT COUNT(*) FROM usage_logs
+		 WHERE chat_id = ? AND created_at >= datetime('now', '-60 seconds')`,
+		chatID,
+	).Scan(&count)
+	return count, err
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/imduchuyyy/opencm/config"
 	"github.com/imduchuyyy/opencm/database"
 	"github.com/imduchuyyy/opencm/llm"
+	"github.com/imduchuyyy/opencm/plan"
 	"github.com/imduchuyyy/opencm/tools"
 )
 
@@ -127,11 +128,13 @@ func (a *Agent) isAdmin(chatID, userID int64) bool {
 	return false
 }
 
-// getAdminGroups returns a list of active groups where the given user is an admin
+// getAdminGroups returns a list of active groups where the given user is an admin.
+// Only checks groups where the user has been seen (tracked via group_members table),
+// avoiding O(N) Telegram API calls across all groups.
 func (a *Agent) getAdminGroups(userID int64) []*database.Group {
-	groups, err := a.db.GetActiveGroups()
+	groups, err := a.db.GetUserGroups(userID)
 	if err != nil {
-		log.Printf("[Agent] Error getting groups: %v", err)
+		log.Printf("[Agent] Error getting user groups: %v", err)
 		return nil
 	}
 
@@ -211,6 +214,10 @@ func (a *Agent) handleUpdate(update tgbotapi.Update) {
 			ChatTitle: msg.Chat.Title,
 			ChatType:  msg.Chat.Type,
 		})
+		// Track that this user is in this group
+		if msg.From != nil {
+			a.db.UpsertGroupMember(msg.Chat.ID, msg.From.ID)
+		}
 	}
 
 	// Handle /save command in groups
@@ -424,6 +431,7 @@ func (a *Agent) getOrCreateGroupConfig(chatID int64) *database.GroupConfig {
 	// Create default config
 	cfg = &database.GroupConfig{
 		ChatID:    chatID,
+		Plan:      plan.Free,
 		Model:     a.appConfig.DefaultModel,
 		ChatStyle: "friendly and helpful",
 		CanReply:  true,
@@ -446,6 +454,35 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 
 	// Load per-group config
 	groupCfg := a.getOrCreateGroupConfig(chatID)
+
+	// Enforce plan limits before calling the LLM
+	limits := plan.GetLimits(groupCfg.Plan)
+
+	monthlyUsage, err := a.db.GetMonthlyUsage(chatID)
+	if err != nil {
+		log.Printf("[Agent] Error getting monthly usage for chat %d: %v", chatID, err)
+	} else if monthlyUsage >= limits.MonthlyMessages {
+		log.Printf("[Agent] Chat %d hit monthly limit (%d/%d, plan: %s)", chatID, monthlyUsage, limits.MonthlyMessages, groupCfg.Plan)
+		ids := make([]int64, len(msgs))
+		for i, m := range msgs {
+			ids[i] = m.ID
+		}
+		a.db.MarkMessagesProcessed(ids, "monthly limit reached")
+		return
+	}
+
+	minuteUsage, err := a.db.GetMinuteUsage(chatID)
+	if err != nil {
+		log.Printf("[Agent] Error getting minute usage for chat %d: %v", chatID, err)
+	} else if minuteUsage >= limits.PerMinute {
+		log.Printf("[Agent] Chat %d hit rate limit (%d/%d per min, plan: %s)", chatID, minuteUsage, limits.PerMinute, groupCfg.Plan)
+		ids := make([]int64, len(msgs))
+		for i, m := range msgs {
+			ids[i] = m.ID
+		}
+		a.db.MarkMessagesProcessed(ids, "rate limit reached")
+		return
+	}
 
 	// Get last 10 messages for context
 	recentMsgs, _ := a.db.GetRecentMessages(chatID, 10)
@@ -554,6 +591,11 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 
 	// Delete the "Thinking..." message
 	a.deleteThinking(chatID, thinkingMsgID)
+
+	// Log usage for this AI response
+	if err := a.db.LogUsage(chatID); err != nil {
+		log.Printf("[Agent] Error logging usage for chat %d: %v", chatID, err)
+	}
 
 	responseText := strings.TrimSpace(response.Text)
 	if responseText != "" && !strings.EqualFold(responseText, "done") {

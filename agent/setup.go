@@ -13,6 +13,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/imduchuyyy/opencm/database"
 	"github.com/imduchuyyy/opencm/llm"
+	"github.com/imduchuyyy/opencm/plan"
 )
 
 // Setup steps
@@ -164,11 +165,11 @@ func (a *Agent) handleSetupCommand(msg *tgbotapi.Message, text string) {
 		a.handlePermissionToggle(msg, text)
 
 	case text == "/add_knowledge":
-		a.startConfigStep(chatID, userID, StepKnowledgeFile,
+		a.startKnowledgeStep(chatID, userID, StepKnowledgeFile,
 			"Send me a file to add to the knowledge base.\n\nSupported formats: PDF, Markdown (.md), Text (.txt)\n\nThe file will be uploaded to the AI knowledge store so the bot can reference it when answering questions.\n\nSend /cancel to abort.")
 
 	case text == "/add_url":
-		a.startConfigStep(chatID, userID, StepKnowledgeURL,
+		a.startKnowledgeStep(chatID, userID, StepKnowledgeURL,
 			"Send me a URL to fetch and store as knowledge.\n\nI'll download the page content and upload it to the knowledge base.")
 
 	case text == "/list_knowledge":
@@ -179,6 +180,9 @@ func (a *Agent) handleSetupCommand(msg *tgbotapi.Message, text string) {
 
 	case text == "/groups":
 		a.sendGroupsList(chatID, userID)
+
+	case text == "/plan":
+		a.sendPlanInfo(chatID, userID)
 
 	case text == "/help":
 		a.sendHelp(chatID)
@@ -223,6 +227,31 @@ func (a *Agent) startConfigStep(chatID, userID int64, step, prompt string) {
 	if !a.isAdmin(state.ChatID, userID) {
 		a.db.SetSetupState(userID, 0, StepIdle)
 		a.send(chatID, "You are no longer an admin of the selected group. Use /setup to select a new group.")
+		return
+	}
+
+	a.db.SetSetupState(userID, state.ChatID, step)
+	a.send(chatID, prompt)
+}
+
+// startKnowledgeStep is like startConfigStep but also checks that the group's plan allows knowledge uploads
+func (a *Agent) startKnowledgeStep(chatID, userID int64, step, prompt string) {
+	state, err := a.db.GetSetupState(userID)
+	if err != nil || state.ChatID == 0 {
+		a.send(chatID, "Please select a group first. Use /setup to choose a group.")
+		return
+	}
+
+	if !a.isAdmin(state.ChatID, userID) {
+		a.db.SetSetupState(userID, 0, StepIdle)
+		a.send(chatID, "You are no longer an admin of the selected group. Use /setup to select a new group.")
+		return
+	}
+
+	groupCfg := a.getOrCreateGroupConfig(state.ChatID)
+	limits := plan.GetLimits(groupCfg.Plan)
+	if !limits.KnowledgeUpload {
+		a.send(chatID, fmt.Sprintf("Knowledge uploads are not available on the %s plan.\n\nUpgrade to Pro or Max to use the knowledge base.", groupCfg.Plan.DisplayName()))
 		return
 	}
 
@@ -387,12 +416,8 @@ func (a *Agent) sendCurrentConfig(chatID, userID int64) {
 
 	// Get group title for display
 	groupTitle := fmt.Sprintf("Group %d", groupChatID)
-	groups, _ := a.db.GetActiveGroups()
-	for _, g := range groups {
-		if g.ChatID == groupChatID {
-			groupTitle = g.ChatTitle
-			break
-		}
+	if g, err := a.db.GetGroup(groupChatID); err == nil {
+		groupTitle = g.ChatTitle
 	}
 
 	text := fmt.Sprintf("Configuration for: %s\n\n"+
@@ -535,6 +560,47 @@ func (a *Agent) sendGroupsList(chatID, userID int64) {
 	a.send(chatID, "Groups where you're admin:\n\n"+strings.Join(lines, "\n")+selectedNote)
 }
 
+func (a *Agent) sendPlanInfo(chatID, userID int64) {
+	groupChatID := a.getSelectedGroupChatID(userID)
+	if groupChatID == 0 {
+		a.send(chatID, "No group selected. Use /setup to select a group first.")
+		return
+	}
+
+	groupCfg := a.getOrCreateGroupConfig(groupChatID)
+	limits := plan.GetLimits(groupCfg.Plan)
+
+	monthlyUsage, _ := a.db.GetMonthlyUsage(groupChatID)
+
+	// Get group title
+	groupTitle := fmt.Sprintf("Group %d", groupChatID)
+	if g, err := a.db.GetGroup(groupChatID); err == nil {
+		groupTitle = g.ChatTitle
+	}
+
+	knowledgeStatus := "Not available"
+	if limits.KnowledgeUpload {
+		knowledgeStatus = fmt.Sprintf("Enabled (max %s per file)", formatFileSize(limits.MaxFileSize))
+	}
+
+	text := fmt.Sprintf("Plan for: %s\n\n"+
+		"Current Plan: %s\n\n"+
+		"Usage This Month: %d / %d messages\n"+
+		"Rate Limit: %d messages/min\n"+
+		"Knowledge Upload: %s\n\n"+
+		"Plans:\n"+
+		"  Free - 1,000 msgs/mo, 10/min, no knowledge\n"+
+		"  Pro ($49/mo) - 10,000 msgs/mo, 100/min, knowledge (5MB)\n"+
+		"  Max ($99/mo) - 50,000 msgs/mo, 100/min, knowledge (20MB)",
+		groupTitle,
+		groupCfg.Plan.DisplayName(),
+		monthlyUsage, limits.MonthlyMessages,
+		limits.PerMinute,
+		knowledgeStatus,
+	)
+	a.send(chatID, text)
+}
+
 func (a *Agent) sendHelp(chatID int64) {
 	text := "Available Commands\n\n" +
 		"Setup:\n" +
@@ -557,6 +623,7 @@ func (a *Agent) sendHelp(chatID int64) {
 		"Reply /save to any message to save it as knowledge\n\n" +
 		"Info:\n" +
 		"/groups - View your admin groups\n" +
+		"/plan - View plan and usage\n" +
 		"/help - Show this message"
 	a.send(chatID, text)
 }
@@ -597,8 +664,12 @@ func (a *Agent) handleKnowledgeFile(msg *tgbotapi.Message, groupChatID int64) {
 		return
 	}
 
-	if doc.FileSize > 20*1024*1024 {
-		a.send(chatID, "File is too large (max 20MB). Please send a smaller file.")
+	// Enforce file size limit based on plan
+	groupCfg := a.getOrCreateGroupConfig(groupChatID)
+	limits := plan.GetLimits(groupCfg.Plan)
+	if int64(doc.FileSize) > limits.MaxFileSize {
+		a.send(chatID, fmt.Sprintf("File is too large (max %s on the %s plan). Please send a smaller file.",
+			formatFileSize(limits.MaxFileSize), groupCfg.Plan.DisplayName()))
 		return
 	}
 
@@ -622,7 +693,7 @@ func (a *Agent) handleKnowledgeFile(msg *tgbotapi.Message, groupChatID int64) {
 	}
 	defer resp.Body.Close()
 
-	fileBytes, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
+	fileBytes, err := io.ReadAll(io.LimitReader(resp.Body, limits.MaxFileSize))
 	if err != nil {
 		log.Printf("[Agent] Error reading file content: %v", err)
 		a.send(chatID, "Error reading file content. Please try again.")
@@ -858,6 +929,16 @@ func (a *Agent) handleSaveCommand(msg *tgbotapi.Message) {
 	// Check if sender is an admin of this group
 	if !a.isAdmin(msg.Chat.ID, msg.From.ID) {
 		return // Silently ignore non-admin
+	}
+
+	// Check plan allows knowledge uploads
+	groupCfg := a.getOrCreateGroupConfig(msg.Chat.ID)
+	limits := plan.GetLimits(groupCfg.Plan)
+	if !limits.KnowledgeUpload {
+		reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Knowledge uploads are not available on the %s plan. Upgrade to Pro or Max.", groupCfg.Plan.DisplayName()))
+		reply.ReplyToMessageID = msg.MessageID
+		a.bot.Send(reply)
+		return
 	}
 
 	savedMsg := msg.ReplyToMessage
