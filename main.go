@@ -7,10 +7,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/imduchuyyy/opencm/internal/agent"
-	"github.com/imduchuyyy/opencm/internal/config"
-	"github.com/imduchuyyy/opencm/internal/database"
-	"github.com/imduchuyyy/opencm/internal/master"
+	"github.com/imduchuyyy/opencm/agent"
+	"github.com/imduchuyyy/opencm/config"
+	"github.com/imduchuyyy/opencm/database"
 )
 
 func main() {
@@ -19,8 +18,11 @@ func main() {
 	// Load configuration
 	cfg := config.Load()
 
-	if cfg.MasterBotToken == "" {
-		log.Fatal("MASTER_BOT_TOKEN environment variable is required")
+	if cfg.BotToken == "" {
+		log.Fatal("BOT_TOKEN environment variable is required")
+	}
+	if cfg.OpenAIAPIKey == "" {
+		log.Fatal("OPENAI_API_KEY environment variable is required")
 	}
 
 	// Initialize database
@@ -31,23 +33,15 @@ func main() {
 	defer db.Close()
 	log.Println("Database initialized")
 
+	// Create the single agent bot
+	bot, err := agent.New(cfg, db)
+	if err != nil {
+		log.Fatalf("Failed to create agent bot: %v", err)
+	}
+
 	// Create context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	// Initialize agent manager
-	agentManager := agent.NewManager(db, cfg)
-
-	// Start all existing agents
-	if err := agentManager.StartAll(ctx); err != nil {
-		log.Printf("Warning: Error starting existing agents: %v", err)
-	}
-
-	// Initialize and start master bot
-	masterBot, err := master.New(cfg, db, agentManager)
-	if err != nil {
-		log.Fatalf("Failed to create master bot: %v", err)
-	}
 
 	// Handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -56,11 +50,10 @@ func main() {
 	go func() {
 		sig := <-sigChan
 		log.Printf("Received signal %v, shutting down...", sig)
-		masterBot.Stop()
-		agentManager.StopAll()
+		bot.Stop()
 		cancel()
 	}()
 
 	log.Println("OpenCM is running. Press Ctrl+C to stop.")
-	masterBot.Start(ctx)
+	bot.Start(ctx)
 }

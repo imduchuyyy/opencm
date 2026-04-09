@@ -2,22 +2,10 @@ package database
 
 import "time"
 
-// Bot represents a registered agent bot
-type Bot struct {
-	ID        int64     `json:"id"`
-	OwnerID   int64     `json:"owner_id"`  // Telegram user ID of the owner
-	BotToken  string    `json:"bot_token"` // Telegram bot API token
-	BotID     int64     `json:"bot_id"`    // Telegram bot user ID
-	BotName   string    `json:"bot_name"`  // Bot username
-	IsActive  bool      `json:"is_active"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
-
-// AgentConfig holds the AI agent configuration for a bot
-type AgentConfig struct {
+// GroupConfig holds the AI agent configuration for a specific group
+type GroupConfig struct {
 	ID              int64  `json:"id"`
-	BotID           int64  `json:"bot_id"`
+	ChatID          int64  `json:"chat_id"` // Telegram chat ID (group/supergroup)
 	SystemPrompt    string `json:"system_prompt"`
 	Bio             string `json:"bio"`
 	Topics          string `json:"topics"`
@@ -30,16 +18,24 @@ type AgentConfig struct {
 	CanBan    bool      `json:"can_ban"`
 	CanPin    bool      `json:"can_pin"`
 	CanPoll   bool      `json:"can_poll"`
-	CanReact  bool      `json:"can_react"`
 	CanDelete bool      `json:"can_delete"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// Message stores every message received by an agent bot
+// Group tracks which groups the bot has been added to
+type Group struct {
+	ID        int64     `json:"id"`
+	ChatID    int64     `json:"chat_id"`
+	ChatTitle string    `json:"chat_title"`
+	ChatType  string    `json:"chat_type"` // group, supergroup
+	IsActive  bool      `json:"is_active"`
+	JoinedAt  time.Time `json:"joined_at"`
+}
+
+// Message stores every message received by the bot
 type Message struct {
 	ID               int64     `json:"id"`
-	BotID            int64     `json:"bot_id"`
 	ChatID           int64     `json:"chat_id"`
 	ChatType         string    `json:"chat_type"`
 	MessageID        int       `json:"message_id"`
@@ -48,34 +44,25 @@ type Message struct {
 	FromUsername     string    `json:"from_username"`
 	FromFirstName    string    `json:"from_first_name"`
 	Text             string    `json:"text"`
+	MediaType        string    `json:"media_type"`    // "", "photo", "video", "document", "voice", "sticker", "animation"
+	MediaFileID      string    `json:"media_file_id"` // Telegram file_id for the media
 	IsProcessed      bool      `json:"is_processed"`
 	AIResponse       string    `json:"ai_response"`
 	CreatedAt        time.Time `json:"created_at"`
 }
 
-// BotGroup tracks which groups a bot has been added to
-type BotGroup struct {
-	ID        int64     `json:"id"`
-	BotID     int64     `json:"bot_id"`
-	ChatID    int64     `json:"chat_id"`
-	ChatTitle string    `json:"chat_title"`
-	ChatType  string    `json:"chat_type"`
-	IsActive  bool      `json:"is_active"`
-	JoinedAt  time.Time `json:"joined_at"`
-}
-
-// SetupState tracks the configuration conversation state
+// SetupState tracks the configuration conversation state for a user configuring a specific group
 type SetupState struct {
-	ID      int64  `json:"id"`
-	BotID   int64  `json:"bot_id"`
-	OwnerID int64  `json:"owner_id"`
-	Step    string `json:"step"`
+	ID     int64  `json:"id"`
+	UserID int64  `json:"user_id"` // Telegram user ID of the admin
+	ChatID int64  `json:"chat_id"` // Group being configured (0 = selecting a group)
+	Step   string `json:"step"`
 }
 
-// Knowledge stores a piece of knowledge for an agent
+// Knowledge stores a piece of knowledge for a specific group
 type Knowledge struct {
 	ID           int64     `json:"id"`
-	BotID        int64     `json:"bot_id"`
+	ChatID       int64     `json:"chat_id"`     // Group this knowledge belongs to
 	SourceType   string    `json:"source_type"` // text, file, url, chat
 	Title        string    `json:"title"`
 	Content      string    `json:"content"`        // Local preview/summary

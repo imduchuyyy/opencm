@@ -25,7 +25,6 @@ type ToolCall struct {
 type Response struct {
 	Text      string     `json:"text"`
 	ToolCalls []ToolCall `json:"tool_calls"`
-	Skip      bool       `json:"skip"`
 	// ResponseID for multi-turn conversation continuation
 	ResponseID string `json:"response_id"`
 }
@@ -41,6 +40,12 @@ type ToolDef struct {
 type ToolResult struct {
 	CallID string `json:"call_id"`
 	Output string `json:"output"`
+}
+
+// InputMessage represents a user message with optional image attachments
+type InputMessage struct {
+	Text      string   // The text content of the message
+	ImageURLs []string // Optional image URLs to include with the message
 }
 
 // Client wraps the OpenAI SDK
@@ -61,7 +66,7 @@ func NewClient(apiKey, model string) *Client {
 }
 
 // Chat sends messages with tools to the Responses API and returns the result
-func (c *Client) Chat(ctx context.Context, systemPrompt string, userMessages []string, tools []ToolDef, vectorStoreID string) (*Response, error) {
+func (c *Client) Chat(ctx context.Context, systemPrompt string, userMessages []InputMessage, tools []ToolDef, vectorStoreID string) (*Response, error) {
 	// Build input items
 	var inputItems []responses.ResponseInputItemUnionParam
 
@@ -72,11 +77,38 @@ func (c *Client) Chat(ctx context.Context, systemPrompt string, userMessages []s
 		)
 	}
 
-	// User messages
+	// User messages (may contain images)
 	for _, msg := range userMessages {
-		inputItems = append(inputItems,
-			responses.ResponseInputItemParamOfMessage(msg, responses.EasyInputMessageRoleUser),
-		)
+		if len(msg.ImageURLs) == 0 {
+			// Text-only message
+			inputItems = append(inputItems,
+				responses.ResponseInputItemParamOfMessage(msg.Text, responses.EasyInputMessageRoleUser),
+			)
+		} else {
+			// Multimodal message: text + images
+			var contentParts responses.ResponseInputMessageContentListParam
+
+			// Add text part
+			if msg.Text != "" {
+				contentParts = append(contentParts,
+					responses.ResponseInputContentParamOfInputText(msg.Text),
+				)
+			}
+
+			// Add image parts
+			for _, imageURL := range msg.ImageURLs {
+				contentParts = append(contentParts, responses.ResponseInputContentUnionParam{
+					OfInputImage: &responses.ResponseInputImageParam{
+						Detail:   responses.ResponseInputImageDetailAuto,
+						ImageURL: param.NewOpt(imageURL),
+					},
+				})
+			}
+
+			inputItems = append(inputItems,
+				responses.ResponseInputItemParamOfMessage(contentParts, responses.EasyInputMessageRoleUser),
+			)
+		}
 	}
 
 	// Build tools
@@ -186,11 +218,6 @@ func (c *Client) parseResponse(resp *responses.Response) (*Response, error) {
 		case "file_search_call":
 			log.Printf("[LLM] File search executed, queries: %v", item.Queries)
 		}
-	}
-
-	// Check if the AI decided to skip
-	if len(result.ToolCalls) == 1 && result.ToolCalls[0].Name == "skip" {
-		result.Skip = true
 	}
 
 	return result, nil

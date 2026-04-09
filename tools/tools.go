@@ -9,36 +9,26 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/imduchuyyy/opencm/internal/database"
-	"github.com/imduchuyyy/opencm/internal/llm"
+	"github.com/imduchuyyy/opencm/database"
+	"github.com/imduchuyyy/opencm/llm"
 )
 
 // Executor handles executing tool calls from the AI agent
 type Executor struct {
-	bot     *tgbotapi.BotAPI
-	cfg     *database.AgentConfig
-	db      *database.DB
-	botID   int64
-	ownerID int64
+	bot              *tgbotapi.BotAPI
+	cfg              *database.GroupConfig
+	db               *database.DB
+	chatID           int64 // The group chat being processed
+	langSearchAPIKey string
 }
 
-func NewExecutor(bot *tgbotapi.BotAPI, cfg *database.AgentConfig, db *database.DB, botID, ownerID int64) *Executor {
-	return &Executor{bot: bot, cfg: cfg, db: db, botID: botID, ownerID: ownerID}
+func NewExecutor(bot *tgbotapi.BotAPI, cfg *database.GroupConfig, db *database.DB, chatID int64, langSearchAPIKey string) *Executor {
+	return &Executor{bot: bot, cfg: cfg, db: db, chatID: chatID, langSearchAPIKey: langSearchAPIKey}
 }
 
-// GetAvailableTools returns tool definitions based on agent permissions
-func GetAvailableTools(cfg *database.AgentConfig) []llm.ToolDef {
+// GetAvailableTools returns tool definitions based on group permissions
+func GetAvailableTools(cfg *database.GroupConfig) []llm.ToolDef {
 	var tools []llm.ToolDef
-
-	// skip - always available, allows AI to decide not to act
-	tools = append(tools, llm.ToolDef{
-		Name:        "skip",
-		Description: "Skip these messages without taking any action. Use this when the messages don't require a response or action from you.",
-		Parameters: map[string]interface{}{
-			"type":       "object",
-			"properties": map[string]interface{}{},
-		},
-	})
 
 	if cfg.CanReply {
 		tools = append(tools, llm.ToolDef{
@@ -202,31 +192,6 @@ func GetAvailableTools(cfg *database.AgentConfig) []llm.ToolDef {
 		})
 	}
 
-	if cfg.CanReact {
-		tools = append(tools, llm.ToolDef{
-			Name:        "set_reaction",
-			Description: "Set a reaction emoji on a message.",
-			Parameters: map[string]interface{}{
-				"type": "object",
-				"properties": map[string]interface{}{
-					"chat_id": map[string]interface{}{
-						"type":        "integer",
-						"description": "The chat ID",
-					},
-					"message_id": map[string]interface{}{
-						"type":        "integer",
-						"description": "The message ID to react to",
-					},
-					"emoji": map[string]interface{}{
-						"type":        "string",
-						"description": "The emoji to react with (e.g. '👍', '❤️', '🔥', '👀', '🎉')",
-					},
-				},
-				"required": []string{"chat_id", "message_id", "emoji"},
-			},
-		})
-	}
-
 	if cfg.CanDelete {
 		tools = append(tools, llm.ToolDef{
 			Name:        "delete_message",
@@ -248,26 +213,45 @@ func GetAvailableTools(cfg *database.AgentConfig) []llm.ToolDef {
 		})
 	}
 
-	// Web viewing tool - always available
+	// Web tools - always available
 	tools = append(tools, llm.ToolDef{
-		Name:        "view_website",
-		Description: "Fetch and read the content of a URL/website that was shared in the chat. Use this to understand links shared by members.",
+		Name:        "web_search",
+		Description: "Search the web for real-time information. Use this for current events, recent data, or any information beyond your knowledge cutoff. The current year is " + fmt.Sprintf("%d", time.Now().Year()) + ".",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "The search query",
+				},
+				"num_results": map[string]interface{}{
+					"type":        "integer",
+					"description": "Number of results to return (default: 5, max: 10)",
+				},
+			},
+			"required": []string{"query"},
+		},
+	})
+
+	tools = append(tools, llm.ToolDef{
+		Name:        "web_fetch",
+		Description: "Fetch and read the content of a URL/website. Returns the page content as plain text. Use this to read links shared in chat or referenced in search results.",
 		Parameters: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"url": map[string]interface{}{
 					"type":        "string",
-					"description": "The URL to fetch and read",
+					"description": "The URL to fetch (must start with http:// or https://)",
 				},
 			},
 			"required": []string{"url"},
 		},
 	})
 
-	// Config tools - always available, admin-only enforcement is in the executor
+	// Config tools - always available, admin enforcement happens in executor via Telegram API
 	tools = append(tools, llm.ToolDef{
 		Name:        "get_config",
-		Description: "Get the current bot configuration. Returns system_prompt, bio, topics, chat_style, message_examples, model, and permission settings.",
+		Description: "Get the current bot configuration for this group. Returns system_prompt, bio, topics, chat_style, message_examples, model, and permission settings.",
 		Parameters: map[string]interface{}{
 			"type":       "object",
 			"properties": map[string]interface{}{},
@@ -276,13 +260,13 @@ func GetAvailableTools(cfg *database.AgentConfig) []llm.ToolDef {
 
 	tools = append(tools, llm.ToolDef{
 		Name:        "set_config",
-		Description: "Update a bot configuration field. Only the group admin can use this. Available fields: system_prompt, bio, topics, chat_style, message_examples, model. For permissions use: can_reply, can_ban, can_pin, can_poll, can_react, can_delete (values: true/false).",
+		Description: "Update a bot configuration field for this group. Only group admins can use this. Available fields: system_prompt, bio, topics, chat_style, message_examples, model. For permissions use: can_reply, can_ban, can_pin, can_poll, can_delete (values: true/false).",
 		Parameters: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"field": map[string]interface{}{
 					"type":        "string",
-					"description": "The config field to update (e.g. system_prompt, bio, topics, chat_style, message_examples, model, can_reply, can_ban, can_pin, can_poll, can_react, can_delete)",
+					"description": "The config field to update (e.g. system_prompt, bio, topics, chat_style, message_examples, model, can_reply, can_ban, can_pin, can_poll, can_delete)",
 				},
 				"value": map[string]interface{}{
 					"type":        "string",
@@ -303,8 +287,6 @@ func GetAvailableTools(cfg *database.AgentConfig) []llm.ToolDef {
 // Execute runs a tool call and returns the result as a string
 func (e *Executor) Execute(tc llm.ToolCall) (string, error) {
 	switch tc.Name {
-	case "skip":
-		return "Skipped.", nil
 	case "send_message":
 		return e.sendMessage(tc.Arguments)
 	case "ban_member":
@@ -319,12 +301,12 @@ func (e *Executor) Execute(tc llm.ToolCall) (string, error) {
 		return e.unpinMessage(tc.Arguments)
 	case "send_poll":
 		return e.sendPoll(tc.Arguments)
-	case "set_reaction":
-		return e.setReaction(tc.Arguments)
 	case "delete_message":
 		return e.deleteMessage(tc.Arguments)
-	case "view_website":
-		return e.viewWebsite(tc.Arguments)
+	case "web_search":
+		return e.webSearch(tc.Arguments)
+	case "web_fetch":
+		return e.webFetch(tc.Arguments)
 	case "get_config":
 		return e.getConfig()
 	case "set_config":
@@ -347,7 +329,6 @@ func (e *Executor) sendMessage(args map[string]interface{}) (string, error) {
 
 	sent, err := e.bot.Send(msg)
 	if err != nil {
-		// Retry without markdown if it fails
 		msg.ParseMode = ""
 		sent, err = e.bot.Send(msg)
 		if err != nil {
@@ -363,7 +344,6 @@ func (e *Executor) sendMessage(args map[string]interface{}) (string, error) {
 			replyToID = int(replyTo.(float64))
 		}
 		dbMsg := &database.Message{
-			BotID:            e.botID,
 			ChatID:           chatID,
 			ChatType:         "group",
 			MessageID:        sent.MessageID,
@@ -436,7 +416,7 @@ func (e *Executor) muteMember(args map[string]interface{}) (string, error) {
 		Permissions: &permissions,
 	}
 	if duration > 0 {
-		cfg.UntilDate = int64(duration) + jsonTimeNow()
+		cfg.UntilDate = duration + time.Now().Unix()
 	}
 
 	_, err := e.bot.Request(cfg)
@@ -503,32 +483,6 @@ func (e *Executor) sendPoll(args map[string]interface{}) (string, error) {
 	return fmt.Sprintf("Poll sent (Message ID: %d)", sent.MessageID), nil
 }
 
-func (e *Executor) setReaction(args map[string]interface{}) (string, error) {
-	chatID := int64(args["chat_id"].(float64))
-	messageID := int(args["message_id"].(float64))
-	emoji := args["emoji"].(string)
-
-	// Use raw API call for reactions since the library may not have direct support
-	params := tgbotapi.Params{}
-	params.AddFirstValid("chat_id", chatID)
-	params.AddNonZero("message_id", messageID)
-
-	reaction := []map[string]interface{}{
-		{
-			"type":  "emoji",
-			"emoji": emoji,
-		},
-	}
-	reactionJSON, _ := json.Marshal(reaction)
-	params["reaction"] = string(reactionJSON)
-
-	_, err := e.bot.MakeRequest("setMessageReaction", params)
-	if err != nil {
-		return "", fmt.Errorf("set reaction: %w", err)
-	}
-	return fmt.Sprintf("Reaction %s set on message %d", emoji, messageID), nil
-}
-
 func (e *Executor) deleteMessage(args map[string]interface{}) (string, error) {
 	chatID := int64(args["chat_id"].(float64))
 	messageID := int(args["message_id"].(float64))
@@ -541,18 +495,122 @@ func (e *Executor) deleteMessage(args map[string]interface{}) (string, error) {
 	return fmt.Sprintf("Message %d deleted from chat %d", messageID, chatID), nil
 }
 
-func (e *Executor) viewWebsite(args map[string]interface{}) (string, error) {
-	url := args["url"].(string)
-	if !strings.HasPrefix(url, "http") {
-		url = "https://" + url
+func (e *Executor) webSearch(args map[string]interface{}) (string, error) {
+	query, _ := args["query"].(string)
+	if query == "" {
+		return "", fmt.Errorf("query is required")
 	}
 
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", url, nil)
+	numResults := 5
+	if n, ok := args["num_results"].(float64); ok && int(n) > 0 {
+		numResults = int(n)
+		if numResults > 10 {
+			numResults = 10
+		}
+	}
+
+	if e.langSearchAPIKey == "" {
+		return "Web search is not configured (missing LANGSEARCH_API_KEY).", nil
+	}
+
+	requestBody := map[string]interface{}{
+		"query":     query,
+		"count":     numResults,
+		"summary":   true,
+		"freshness": "noLimit",
+	}
+
+	bodyJSON, err := json.Marshal(requestBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
+	}
+
+	client := &http.Client{Timeout: 25 * time.Second}
+	req, err := http.NewRequest("POST", "https://api.langsearch.com/v1/web-search", strings.NewReader(string(bodyJSON)))
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; OpenCM Bot/1.0)")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+e.langSearchAPIKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("search request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return "", fmt.Errorf("search error (%d): %s", resp.StatusCode, string(body))
+	}
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 200*1024))
+	if err != nil {
+		return "", fmt.Errorf("read response: %w", err)
+	}
+
+	var searchResp struct {
+		Code int `json:"code"`
+		Data struct {
+			WebPages struct {
+				Value []struct {
+					Name    string `json:"name"`
+					URL     string `json:"url"`
+					Snippet string `json:"snippet"`
+					Summary string `json:"summary"`
+				} `json:"value"`
+			} `json:"webPages"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(respBody, &searchResp); err != nil {
+		return "", fmt.Errorf("parse response: %w", err)
+	}
+
+	if len(searchResp.Data.WebPages.Value) == 0 {
+		return "No search results found. Try a different query.", nil
+	}
+
+	var results []string
+	for i, page := range searchResp.Data.WebPages.Value {
+		entry := fmt.Sprintf("%d. %s\n   URL: %s", i+1, page.Name, page.URL)
+		if page.Summary != "" {
+			summary := page.Summary
+			if len(summary) > 1000 {
+				summary = summary[:1000] + "..."
+			}
+			entry += fmt.Sprintf("\n   Summary: %s", summary)
+		} else if page.Snippet != "" {
+			entry += fmt.Sprintf("\n   Snippet: %s", page.Snippet)
+		}
+		results = append(results, entry)
+	}
+
+	output := fmt.Sprintf("Search results for \"%s\":\n\n%s", query, strings.Join(results, "\n\n"))
+	if len(output) > 8000 {
+		output = output[:8000] + "\n... (truncated)"
+	}
+	return output, nil
+}
+
+func (e *Executor) webFetch(args map[string]interface{}) (string, error) {
+	url, _ := args["url"].(string)
+	if url == "" {
+		return "", fmt.Errorf("url is required")
+	}
+
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		url = "https://" + url
+	}
+
+	jinaURL := "https://r.jina.ai/" + url
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequest("GET", jinaURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Accept", "text/plain")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -560,31 +618,33 @@ func (e *Executor) viewWebsite(args map[string]interface{}) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	// Limit reading to 50KB
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 50*1024))
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("request failed with status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
 	if err != nil {
 		return "", fmt.Errorf("read response: %w", err)
 	}
 
-	content := string(body)
-	content = stripHTMLTags(content)
+	content := strings.TrimSpace(string(body))
 
-	if len(content) > 5000 {
-		content = content[:5000] + "\n... (truncated)"
+	if len(content) > 8000 {
+		content = content[:8000] + "\n... (truncated)"
 	}
 
-	return fmt.Sprintf("Website content from %s:\n%s", url, content), nil
+	return fmt.Sprintf("Content from %s:\n%s", url, content), nil
 }
 
 // ----- Config tools -----
 
 func (e *Executor) getConfig() (string, error) {
-	cfg, err := e.db.GetAgentConfig(e.botID)
+	cfg, err := e.db.GetGroupConfig(e.chatID)
 	if err != nil {
 		return "", fmt.Errorf("get config: %w", err)
 	}
 
-	result := fmt.Sprintf("Current bot configuration:\n"+
+	result := fmt.Sprintf("Current bot configuration for this group:\n"+
 		"- system_prompt: %s\n"+
 		"- bio: %s\n"+
 		"- topics: %s\n"+
@@ -595,7 +655,6 @@ func (e *Executor) getConfig() (string, error) {
 		"- can_ban: %v\n"+
 		"- can_pin: %v\n"+
 		"- can_poll: %v\n"+
-		"- can_react: %v\n"+
 		"- can_delete: %v",
 		truncateStr(cfg.SystemPrompt, 200),
 		truncateStr(cfg.Bio, 200),
@@ -603,7 +662,7 @@ func (e *Executor) getConfig() (string, error) {
 		truncateStr(cfg.ChatStyle, 200),
 		truncateStr(cfg.MessageExamples, 200),
 		cfg.Model,
-		cfg.CanReply, cfg.CanBan, cfg.CanPin, cfg.CanPoll, cfg.CanReact, cfg.CanDelete,
+		cfg.CanReply, cfg.CanBan, cfg.CanPin, cfg.CanPoll, cfg.CanDelete,
 	)
 	return result, nil
 }
@@ -616,20 +675,38 @@ func (e *Executor) setConfig(args map[string]interface{}) (string, error) {
 		requestedBy = int64(uid.(float64))
 	}
 
-	// Check admin permission
-	if requestedBy != e.ownerID {
-		return "Permission denied. Only the group admin can change bot settings.", nil
+	// Check admin permission via Telegram API
+	if requestedBy == 0 {
+		return "Permission denied. Could not identify the requesting user.", nil
+	}
+
+	admins, err := e.bot.GetChatAdministrators(tgbotapi.ChatAdministratorsConfig{
+		ChatConfig: tgbotapi.ChatConfig{ChatID: e.chatID},
+	})
+	if err != nil {
+		return "Permission denied. Could not verify admin status.", nil
+	}
+
+	isAdmin := false
+	for _, admin := range admins {
+		if admin.User.ID == requestedBy {
+			isAdmin = true
+			break
+		}
+	}
+	if !isAdmin {
+		return "Permission denied. Only group admins can change bot settings.", nil
 	}
 
 	// Permission fields (boolean)
 	boolFields := map[string]bool{
 		"can_reply": true, "can_ban": true, "can_pin": true,
-		"can_poll": true, "can_react": true, "can_delete": true,
+		"can_poll": true, "can_delete": true,
 	}
 
 	if boolFields[field] {
 		boolVal := strings.ToLower(value) == "true" || value == "1" || strings.ToLower(value) == "on"
-		if err := e.db.UpdateAgentConfigBool(e.botID, field, boolVal); err != nil {
+		if err := e.db.UpdateGroupConfigBool(e.chatID, field, boolVal); err != nil {
 			return "", fmt.Errorf("update config: %w", err)
 		}
 		return fmt.Sprintf("Configuration updated: %s = %v", field, boolVal), nil
@@ -642,37 +719,16 @@ func (e *Executor) setConfig(args map[string]interface{}) (string, error) {
 	}
 
 	if textFields[field] {
-		if err := e.db.UpdateAgentConfigField(e.botID, field, value); err != nil {
+		if err := e.db.UpdateGroupConfigField(e.chatID, field, value); err != nil {
 			return "", fmt.Errorf("update config: %w", err)
 		}
 		return fmt.Sprintf("Configuration updated: %s", field), nil
 	}
 
-	return fmt.Sprintf("Unknown config field: %s. Available fields: system_prompt, bio, topics, chat_style, message_examples, model, can_reply, can_ban, can_pin, can_poll, can_react, can_delete", field), nil
+	return fmt.Sprintf("Unknown config field: %s. Available fields: system_prompt, bio, topics, chat_style, message_examples, model, can_reply, can_ban, can_pin, can_poll, can_delete", field), nil
 }
 
 // ----- Helpers -----
-
-// stripHTMLTags removes HTML tags from a string (basic implementation)
-func stripHTMLTags(s string) string {
-	var result strings.Builder
-	inTag := false
-	for _, r := range s {
-		if r == '<' {
-			inTag = true
-			continue
-		}
-		if r == '>' {
-			inTag = false
-			result.WriteRune(' ')
-			continue
-		}
-		if !inTag {
-			result.WriteRune(r)
-		}
-	}
-	return result.String()
-}
 
 func truncateStr(s string, max int) string {
 	if len(s) > max {
@@ -682,8 +738,4 @@ func truncateStr(s string, max int) string {
 		return "(not set)"
 	}
 	return s
-}
-
-func jsonTimeNow() int64 {
-	return time.Now().Unix()
 }
