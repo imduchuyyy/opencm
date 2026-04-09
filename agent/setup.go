@@ -38,16 +38,11 @@ var allowedKnowledgeExts = map[string]bool{
 	".txt": true,
 }
 
-// send sends a message with Markdown, falling back to plain text on failure
+// send sends a plain text message to a chat
 func (a *Agent) send(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "Markdown"
 	if _, err := a.bot.Send(msg); err != nil {
-		log.Printf("[Agent] Markdown send failed: %v, retrying plain", err)
-		msg.ParseMode = ""
-		if _, err := a.bot.Send(msg); err != nil {
-			log.Printf("[Agent] Send failed: %v", err)
-		}
+		log.Printf("[Agent] Send failed: %v", err)
 	}
 }
 
@@ -93,7 +88,7 @@ func (a *Agent) handlePrivateMessage(msg *tgbotapi.Message) {
 			a.handleKnowledgeFile(msg, state.ChatID)
 			return
 		}
-		a.send(msg.Chat.ID, "To upload a file as knowledge, first use /add_knowledge then send the file.")
+		a.send(msg.Chat.ID, MsgDocNeedStep)
 		return
 	}
 
@@ -125,74 +120,66 @@ func (a *Agent) handleSetupCommand(msg *tgbotapi.Message, text string) {
 	userID := msg.From.ID
 
 	switch {
-	case text == "/start":
+	case text == CmdStart:
 		a.sendSetupWelcome(chatID)
 
-	case text == "/setup":
+	case text == CmdSetup:
 		a.startGroupSelection(chatID, userID)
 
-	case text == "/config":
+	case text == CmdConfig:
 		a.sendCurrentConfig(chatID, userID)
 
-	case text == "/set_system_prompt":
-		a.startConfigStep(chatID, userID, StepSystemPrompt,
-			"Send me the system prompt for the bot in this group.\n\nThis is the core instruction that tells the AI how to behave. Example:\n\n\"You are a helpful community manager for a crypto trading group. Keep discussions on topic, help newcomers, and moderate spam.\"")
+	case text == CmdSetSystemPrompt:
+		a.startConfigStep(chatID, userID, StepSystemPrompt, MsgPromptSystemPrompt)
 
-	case text == "/set_bio":
-		a.startConfigStep(chatID, userID, StepBio,
-			"Send me the bot's bio/description.\n\nThis helps the AI understand its identity. Example:\n\n\"CryptoBot - Your friendly crypto community assistant, helping since 2024\"")
+	case text == CmdSetBio:
+		a.startConfigStep(chatID, userID, StepBio, MsgPromptBio)
 
-	case text == "/set_topics":
-		a.startConfigStep(chatID, userID, StepTopics,
-			"Send me the topics the bot should cover (comma-separated).\n\nExample:\n\"cryptocurrency, trading, DeFi, market analysis, technical analysis\"")
+	case text == CmdSetTopics:
+		a.startConfigStep(chatID, userID, StepTopics, MsgPromptTopics)
 
-	case text == "/set_examples":
-		a.startConfigStep(chatID, userID, StepMessageExamples,
-			"Send me example messages that show the bot's style.\n\nPut each example on a new line. Example:\n\n\"Welcome aboard! Feel free to ask anything about trading.\"\n\"Great question! Here's what I think about BTC...\"\n\"Please keep the discussion civil, folks.\"")
+	case text == CmdSetExamples:
+		a.startConfigStep(chatID, userID, StepMessageExamples, MsgPromptExamples)
 
-	case text == "/set_style":
-		a.startConfigStep(chatID, userID, StepChatStyle,
-			"Describe the chat style for your bot.\n\nExample:\n\"Friendly and casual, uses occasional emojis, speaks like a knowledgeable friend rather than a formal assistant\"")
+	case text == CmdSetStyle:
+		a.startConfigStep(chatID, userID, StepChatStyle, MsgPromptStyle)
 
-	case text == "/set_model":
-		a.startConfigStep(chatID, userID, StepModel,
-			"Send me the OpenAI model name to use.\n\nExamples: gpt-4o, gpt-4o-mini, gpt-4.1, gpt-4.1-mini")
+	case text == CmdSetModel:
+		a.startConfigStep(chatID, userID, StepModel, MsgPromptModel)
 
-	case text == "/set_permissions":
+	case text == CmdSetPermissions:
 		a.sendPermissionsMenu(chatID, userID)
 
-	case strings.HasPrefix(text, "/perm_"):
+	case strings.HasPrefix(text, CmdPermPrefix):
 		a.handlePermissionToggle(msg, text)
 
-	case text == "/add_knowledge":
-		a.startKnowledgeStep(chatID, userID, StepKnowledgeFile,
-			"Send me a file to add to the knowledge base.\n\nSupported formats: PDF, Markdown (.md), Text (.txt)\n\nThe file will be uploaded to the AI knowledge store so the bot can reference it when answering questions.\n\nSend /cancel to abort.")
+	case text == CmdAddKnowledge:
+		a.startKnowledgeStep(chatID, userID, StepKnowledgeFile, MsgPromptKnowledgeFile)
 
-	case text == "/add_url":
-		a.startKnowledgeStep(chatID, userID, StepKnowledgeURL,
-			"Send me a URL to fetch and store as knowledge.\n\nI'll download the page content and upload it to the knowledge base.")
+	case text == CmdAddURL:
+		a.startKnowledgeStep(chatID, userID, StepKnowledgeURL, MsgPromptKnowledgeURL)
 
-	case text == "/list_knowledge":
+	case text == CmdListKnowledge:
 		a.sendKnowledgeList(chatID, userID)
 
-	case strings.HasPrefix(text, "/delete_knowledge"):
+	case strings.HasPrefix(text, CmdDeleteKnowledge):
 		a.handleDeleteKnowledge(chatID, userID, text)
 
-	case text == "/groups":
+	case text == CmdGroups:
 		a.sendGroupsList(chatID, userID)
 
-	case text == "/plan":
+	case text == CmdPlan:
 		a.sendPlanInfo(chatID, userID)
 
-	case text == "/help":
+	case text == CmdHelp:
 		a.sendHelp(chatID)
 
-	case text == "/cancel":
+	case text == CmdCancel:
 		a.db.SetSetupState(userID, 0, StepIdle)
-		a.send(chatID, "Cancelled. Use /setup to select a group and configure.")
+		a.send(chatID, MsgCancelled)
 
 	default:
-		a.send(chatID, "Unknown command. Use /help to see available commands.")
+		a.send(chatID, MsgUnknownCommand)
 	}
 }
 
@@ -200,7 +187,7 @@ func (a *Agent) handleSetupCommand(msg *tgbotapi.Message, text string) {
 func (a *Agent) startGroupSelection(chatID, userID int64) {
 	adminGroups := a.getAdminGroups(userID)
 	if len(adminGroups) == 0 {
-		a.send(chatID, "You are not an admin of any groups I'm in.\n\nPlease add me to a group first and make sure you are an admin there.")
+		a.send(chatID, MsgNotAdminAnyGroup)
 		return
 	}
 
@@ -210,8 +197,7 @@ func (a *Agent) startGroupSelection(chatID, userID int64) {
 	}
 
 	a.db.SetSetupState(userID, 0, StepSelectGroup)
-	a.send(chatID, "Select a group to configure:\n\n"+strings.Join(lines, "\n")+
-		"\n\nSend the number of the group you want to configure:")
+	a.send(chatID, fmt.Sprintf(MsgSelectGroupPrompt, strings.Join(lines, "\n")))
 }
 
 // startConfigStep verifies the user has a group selected and sets the step
@@ -219,14 +205,14 @@ func (a *Agent) startConfigStep(chatID, userID int64, step, prompt string) {
 	state, err := a.db.GetSetupState(userID)
 	if err != nil || state.ChatID == 0 {
 		// No group selected - start selection first
-		a.send(chatID, "Please select a group first. Use /setup to choose a group.")
+		a.send(chatID, MsgSelectGroupFirst)
 		return
 	}
 
 	// Verify user is still admin of this group
 	if !a.isAdmin(state.ChatID, userID) {
 		a.db.SetSetupState(userID, 0, StepIdle)
-		a.send(chatID, "You are no longer an admin of the selected group. Use /setup to select a new group.")
+		a.send(chatID, MsgNoLongerAdmin)
 		return
 	}
 
@@ -238,20 +224,20 @@ func (a *Agent) startConfigStep(chatID, userID int64, step, prompt string) {
 func (a *Agent) startKnowledgeStep(chatID, userID int64, step, prompt string) {
 	state, err := a.db.GetSetupState(userID)
 	if err != nil || state.ChatID == 0 {
-		a.send(chatID, "Please select a group first. Use /setup to choose a group.")
+		a.send(chatID, MsgSelectGroupFirst)
 		return
 	}
 
 	if !a.isAdmin(state.ChatID, userID) {
 		a.db.SetSetupState(userID, 0, StepIdle)
-		a.send(chatID, "You are no longer an admin of the selected group. Use /setup to select a new group.")
+		a.send(chatID, MsgNoLongerAdmin)
 		return
 	}
 
 	groupCfg := a.getOrCreateGroupConfig(state.ChatID)
 	limits := plan.GetLimits(groupCfg.Plan)
 	if !limits.KnowledgeUpload {
-		a.send(chatID, fmt.Sprintf("Knowledge uploads are not available on the %s plan.\n\nUpgrade to Pro or Max to use the knowledge base.", groupCfg.Plan.DisplayName()))
+		a.send(chatID, fmt.Sprintf(MsgKnowledgeNoUpload, groupCfg.Plan.DisplayName()))
 		return
 	}
 
@@ -271,7 +257,7 @@ func (a *Agent) handleSetupInput(msg *tgbotapi.Message, text string) {
 	}
 
 	if state.Step == StepIdle {
-		a.send(chatID, "Use /setup to configure bot settings for your group, or /help for available commands.")
+		a.send(chatID, MsgUseSetupOrHelp)
 		return
 	}
 
@@ -284,7 +270,7 @@ func (a *Agent) handleSetupInput(msg *tgbotapi.Message, text string) {
 	// Handle knowledge steps
 	switch state.Step {
 	case StepKnowledgeFile:
-		a.send(chatID, "Please send a file (PDF, .md, or .txt).\n\nSend /cancel to abort.")
+		a.send(chatID, MsgSendFilePrompt)
 		return
 	case StepKnowledgeURL:
 		a.handleKnowledgeURL(chatID, userID, state.ChatID, text)
@@ -309,7 +295,7 @@ func (a *Agent) handleSetupInput(msg *tgbotapi.Message, text string) {
 
 	groupChatID := state.ChatID
 	if groupChatID == 0 {
-		a.send(chatID, "No group selected. Use /setup to select a group first.")
+		a.send(chatID, MsgNoGroupSelected)
 		return
 	}
 
@@ -319,26 +305,26 @@ func (a *Agent) handleSetupInput(msg *tgbotapi.Message, text string) {
 	// Update the field
 	if err := a.db.UpdateGroupConfigField(groupChatID, field, text); err != nil {
 		log.Printf("[Agent] Error updating config: %v", err)
-		a.send(chatID, "Error saving configuration. Please try again.")
+		a.send(chatID, MsgErrorSaveConfig)
 		return
 	}
 
 	a.db.SetSetupState(userID, groupChatID, StepIdle)
-	a.send(chatID, fmt.Sprintf("%s updated successfully!\n\nUse /config to see current configuration or /setup to continue configuring.", stepDisplayName(state.Step)))
+	a.send(chatID, fmt.Sprintf(MsgFieldUpdated, stepDisplayName(state.Step)))
 }
 
 // handleGroupSelection processes the user's group choice
 func (a *Agent) handleGroupSelection(chatID, userID int64, text string) {
 	adminGroups := a.getAdminGroups(userID)
 	if len(adminGroups) == 0 {
-		a.send(chatID, "No groups found. Add me to a group first.")
+		a.send(chatID, MsgNoGroupsFound)
 		a.db.SetSetupState(userID, 0, StepIdle)
 		return
 	}
 
 	num, err := strconv.Atoi(strings.TrimSpace(text))
 	if err != nil || num < 1 || num > len(adminGroups) {
-		a.send(chatID, fmt.Sprintf("Please send a number between 1 and %d.", len(adminGroups)))
+		a.send(chatID, fmt.Sprintf(MsgInvalidGroupNum, len(adminGroups)))
 		return
 	}
 
@@ -348,33 +334,16 @@ func (a *Agent) handleGroupSelection(chatID, userID int64, text string) {
 	a.getOrCreateGroupConfig(selectedGroup.ChatID)
 
 	a.db.SetSetupState(userID, selectedGroup.ChatID, StepIdle)
-	a.send(chatID, fmt.Sprintf("Selected group: %s\n\nYou can now configure the bot for this group. Use /setup to see the menu, or use any /set_* command directly.", selectedGroup.ChatTitle))
+	a.send(chatID, fmt.Sprintf(MsgGroupSelected, selectedGroup.ChatTitle))
 	a.sendSetupMenu(chatID)
 }
 
 func (a *Agent) sendSetupWelcome(chatID int64) {
-	text := fmt.Sprintf("Welcome! I'm @%s, your AI community manager bot.\n\nTo get started:\n1. Add me to your Telegram group\n2. Make me an admin\n3. Use /setup here to configure my behavior for your group\n\nI manage each group independently with its own personality, knowledge, and permissions.\n\nUse /help to see all available commands.", a.bot.Self.UserName)
-	a.send(chatID, text)
+	a.send(chatID, fmt.Sprintf(MsgWelcome, a.bot.Self.UserName))
 }
 
 func (a *Agent) sendSetupMenu(chatID int64) {
-	text := "Bot Setup Menu\n\nConfigure your bot's personality and behavior:\n\n" +
-		"/set_system_prompt - Core AI instructions\n" +
-		"/set_bio - Bot identity/description\n" +
-		"/set_topics - Topics to cover\n" +
-		"/set_examples - Example messages for style\n" +
-		"/set_style - Chat tone and style\n" +
-		"/set_model - OpenAI model (gpt-4o, gpt-4o-mini, etc.)\n" +
-		"/set_permissions - Toggle bot permissions\n\n" +
-		"Knowledge Base:\n" +
-		"/add_knowledge - Upload a file (PDF, .md, .txt)\n" +
-		"/add_url - Add knowledge from a URL\n" +
-		"/list_knowledge - View all knowledge entries\n\n" +
-		"Tip: Reply /save to any message in a group to save it as knowledge.\n\n" +
-		"/config - View current configuration\n" +
-		"/groups - View groups I'm in where you're admin\n" +
-		"/setup - Switch to a different group"
-	a.send(chatID, text)
+	a.send(chatID, MsgSetupMenu)
 }
 
 // getSelectedGroupChatID returns the group chat ID from setup state, or 0
@@ -389,13 +358,13 @@ func (a *Agent) getSelectedGroupChatID(userID int64) int64 {
 func (a *Agent) sendCurrentConfig(chatID, userID int64) {
 	groupChatID := a.getSelectedGroupChatID(userID)
 	if groupChatID == 0 {
-		a.send(chatID, "No group selected. Use /setup to select a group first.")
+		a.send(chatID, MsgNoGroupSelected)
 		return
 	}
 
 	cfg, err := a.db.GetGroupConfig(groupChatID)
 	if err != nil {
-		a.send(chatID, "No configuration yet. Use /setup to get started.")
+		a.send(chatID, MsgNoConfigYet)
 		return
 	}
 
@@ -454,23 +423,23 @@ func (a *Agent) sendCurrentConfig(chatID, userID int64) {
 func (a *Agent) sendPermissionsMenu(chatID, userID int64) {
 	groupChatID := a.getSelectedGroupChatID(userID)
 	if groupChatID == 0 {
-		a.send(chatID, "No group selected. Use /setup to select a group first.")
+		a.send(chatID, MsgNoGroupSelected)
 		return
 	}
 
 	cfg, err := a.db.GetGroupConfig(groupChatID)
 	if err != nil {
-		a.send(chatID, "Please set up the group first with /setup")
+		a.send(chatID, MsgSetupGroupFirst)
 		return
 	}
 
 	text := fmt.Sprintf("Bot Permissions\n\n"+
 		"Toggle permissions by sending the command:\n\n"+
-		"/perm_reply - Reply to messages [%s]\n"+
-		"/perm_ban - Ban/mute members [%s]\n"+
-		"/perm_pin - Pin messages [%s]\n"+
-		"/perm_poll - Create polls [%s]\n"+
-		"/perm_delete - Delete messages [%s]\n\n"+
+		CmdPermReply+" - Reply to messages [%s]\n"+
+		CmdPermBan+" - Ban/mute members [%s]\n"+
+		CmdPermPin+" - Pin messages [%s]\n"+
+		CmdPermPoll+" - Create polls [%s]\n"+
+		CmdPermDelete+" - Delete messages [%s]\n\n"+
 		"Note: The bot also needs the corresponding Telegram admin permissions in the group.",
 		boolEmoji(cfg.CanReply),
 		boolEmoji(cfg.CanBan),
@@ -487,18 +456,18 @@ func (a *Agent) handlePermissionToggle(msg *tgbotapi.Message, text string) {
 
 	groupChatID := a.getSelectedGroupChatID(userID)
 	if groupChatID == 0 {
-		a.send(chatID, "No group selected. Use /setup to select a group first.")
+		a.send(chatID, MsgNoGroupSelected)
 		return
 	}
 
 	if !a.isAdmin(groupChatID, userID) {
-		a.send(chatID, "You are no longer an admin of the selected group.")
+		a.send(chatID, MsgNoLongerAdmin)
 		return
 	}
 
 	cfg, err := a.db.GetGroupConfig(groupChatID)
 	if err != nil {
-		a.send(chatID, "Please set up the group first with /setup")
+		a.send(chatID, MsgSetupGroupFirst)
 		return
 	}
 
@@ -506,21 +475,21 @@ func (a *Agent) handlePermissionToggle(msg *tgbotapi.Message, text string) {
 		field string
 		value bool
 	}{
-		"/perm_reply":  {"can_reply", !cfg.CanReply},
-		"/perm_ban":    {"can_ban", !cfg.CanBan},
-		"/perm_pin":    {"can_pin", !cfg.CanPin},
-		"/perm_poll":   {"can_poll", !cfg.CanPoll},
-		"/perm_delete": {"can_delete", !cfg.CanDelete},
+		CmdPermReply:  {"can_reply", !cfg.CanReply},
+		CmdPermBan:    {"can_ban", !cfg.CanBan},
+		CmdPermPin:    {"can_pin", !cfg.CanPin},
+		CmdPermPoll:   {"can_poll", !cfg.CanPoll},
+		CmdPermDelete: {"can_delete", !cfg.CanDelete},
 	}
 
 	perm, ok := permMap[text]
 	if !ok {
-		a.send(chatID, "Unknown permission.")
+		a.send(chatID, MsgUnknownPermission)
 		return
 	}
 
 	if err := a.db.UpdateGroupConfigBool(groupChatID, perm.field, perm.value); err != nil {
-		a.send(chatID, "Error updating permission.")
+		a.send(chatID, MsgErrorUpdatePerm)
 		return
 	}
 
@@ -529,14 +498,14 @@ func (a *Agent) handlePermissionToggle(msg *tgbotapi.Message, text string) {
 		status = "enabled"
 	}
 
-	a.send(chatID, fmt.Sprintf("Permission %s %s.", perm.field, status))
+	a.send(chatID, fmt.Sprintf(MsgPermToggled, perm.field, status))
 	a.sendPermissionsMenu(chatID, userID)
 }
 
 func (a *Agent) sendGroupsList(chatID, userID int64) {
 	adminGroups := a.getAdminGroups(userID)
 	if len(adminGroups) == 0 {
-		a.send(chatID, "I'm not in any groups where you're an admin.\n\nAdd me to a group and make sure you're an admin there!")
+		a.send(chatID, MsgNoGroupsAdmin)
 		return
 	}
 
@@ -551,19 +520,19 @@ func (a *Agent) sendGroupsList(chatID, userID int64) {
 	if selectedID != 0 {
 		for _, g := range adminGroups {
 			if g.ChatID == selectedID {
-				selectedNote = fmt.Sprintf("\n\nCurrently configuring: %s", g.ChatTitle)
+				selectedNote = fmt.Sprintf(MsgCurrentlyConfiguring, g.ChatTitle)
 				break
 			}
 		}
 	}
 
-	a.send(chatID, "Groups where you're admin:\n\n"+strings.Join(lines, "\n")+selectedNote)
+	a.send(chatID, fmt.Sprintf(MsgGroupsListHeader, strings.Join(lines, "\n"))+selectedNote)
 }
 
 func (a *Agent) sendPlanInfo(chatID, userID int64) {
 	groupChatID := a.getSelectedGroupChatID(userID)
 	if groupChatID == 0 {
-		a.send(chatID, "No group selected. Use /setup to select a group first.")
+		a.send(chatID, MsgNoGroupSelected)
 		return
 	}
 
@@ -602,30 +571,7 @@ func (a *Agent) sendPlanInfo(chatID, userID int64) {
 }
 
 func (a *Agent) sendHelp(chatID int64) {
-	text := "Available Commands\n\n" +
-		"Setup:\n" +
-		"/setup - Select a group and configure\n" +
-		"/config - View current config\n\n" +
-		"Configuration (for selected group):\n" +
-		"/set_system_prompt - Core AI instructions\n" +
-		"/set_bio - Bot identity\n" +
-		"/set_topics - Topics to cover\n" +
-		"/set_examples - Example messages\n" +
-		"/set_style - Chat style\n" +
-		"/set_model - OpenAI model\n" +
-		"/set_permissions - Toggle permissions\n\n" +
-		"Knowledge Base:\n" +
-		"/add_knowledge - Upload a file (PDF, .md, .txt)\n" +
-		"/add_url - Add knowledge from URL\n" +
-		"/list_knowledge - List all knowledge\n" +
-		"/delete_knowledge <id> - Delete a knowledge entry\n\n" +
-		"In groups (admin only):\n" +
-		"Reply /save to any message to save it as knowledge\n\n" +
-		"Info:\n" +
-		"/groups - View your admin groups\n" +
-		"/plan - View plan and usage\n" +
-		"/help - Show this message"
-	a.send(chatID, text)
+	a.send(chatID, MsgHelp)
 }
 
 func boolEmoji(b bool) string {
@@ -660,7 +606,7 @@ func (a *Agent) handleKnowledgeFile(msg *tgbotapi.Message, groupChatID int64) {
 
 	ext := strings.ToLower(filepath.Ext(doc.FileName))
 	if !allowedKnowledgeExts[ext] {
-		a.send(chatID, fmt.Sprintf("Unsupported file type: %s\n\nPlease send a PDF, Markdown (.md), or Text (.txt) file.", ext))
+		a.send(chatID, fmt.Sprintf(MsgUnsupportedFileType, ext))
 		return
 	}
 
@@ -668,18 +614,18 @@ func (a *Agent) handleKnowledgeFile(msg *tgbotapi.Message, groupChatID int64) {
 	groupCfg := a.getOrCreateGroupConfig(groupChatID)
 	limits := plan.GetLimits(groupCfg.Plan)
 	if int64(doc.FileSize) > limits.MaxFileSize {
-		a.send(chatID, fmt.Sprintf("File is too large (max %s on the %s plan). Please send a smaller file.",
+		a.send(chatID, fmt.Sprintf(MsgFileTooLarge,
 			formatFileSize(limits.MaxFileSize), groupCfg.Plan.DisplayName()))
 		return
 	}
 
-	a.send(chatID, fmt.Sprintf("Downloading %s...", doc.FileName))
+	a.send(chatID, fmt.Sprintf(MsgDownloading, doc.FileName))
 
 	fileConfig := tgbotapi.FileConfig{FileID: doc.FileID}
 	tgFile, err := a.bot.GetFile(fileConfig)
 	if err != nil {
 		log.Printf("[Agent] Error getting file from Telegram: %v", err)
-		a.send(chatID, "Error downloading file from Telegram. Please try again.")
+		a.send(chatID, MsgErrorDownloadTG)
 		return
 	}
 
@@ -688,7 +634,7 @@ func (a *Agent) handleKnowledgeFile(msg *tgbotapi.Message, groupChatID int64) {
 	resp, err := http.Get(fileURL)
 	if err != nil {
 		log.Printf("[Agent] Error downloading file: %v", err)
-		a.send(chatID, "Error downloading file. Please try again.")
+		a.send(chatID, MsgErrorDownload)
 		return
 	}
 	defer resp.Body.Close()
@@ -696,17 +642,17 @@ func (a *Agent) handleKnowledgeFile(msg *tgbotapi.Message, groupChatID int64) {
 	fileBytes, err := io.ReadAll(io.LimitReader(resp.Body, limits.MaxFileSize))
 	if err != nil {
 		log.Printf("[Agent] Error reading file content: %v", err)
-		a.send(chatID, "Error reading file content. Please try again.")
+		a.send(chatID, MsgErrorReadContent)
 		return
 	}
 
-	a.send(chatID, "Uploading to knowledge base...")
+	a.send(chatID, MsgUploadingKB)
 
 	ctx := context.Background()
 	vsID, err := a.ensureVectorStore(ctx, groupChatID)
 	if err != nil {
 		log.Printf("[Agent] Error ensuring vector store: %v", err)
-		a.send(chatID, "Error creating knowledge store. Please try again.")
+		a.send(chatID, MsgErrorKnowledgeStore)
 		a.db.SetSetupState(userID, groupChatID, StepIdle)
 		return
 	}
@@ -716,7 +662,7 @@ func (a *Agent) handleKnowledgeFile(msg *tgbotapi.Message, groupChatID int64) {
 	fileID, err := client.UploadFileToVectorStore(ctx, vsID, doc.FileName, reader)
 	if err != nil {
 		log.Printf("[Agent] Error uploading file to OpenAI: %v", err)
-		a.send(chatID, "Error uploading file to knowledge base. Please try again.")
+		a.send(chatID, MsgErrorUploadKB)
 		a.db.SetSetupState(userID, groupChatID, StepIdle)
 		return
 	}
@@ -733,13 +679,13 @@ func (a *Agent) handleKnowledgeFile(msg *tgbotapi.Message, groupChatID int64) {
 	}
 	if err := a.db.AddKnowledge(k); err != nil {
 		log.Printf("[Agent] Error adding knowledge to DB: %v", err)
-		a.send(chatID, "File uploaded to OpenAI but failed to save local record.")
+		a.send(chatID, MsgErrorUploadLocal)
 		a.db.SetSetupState(userID, groupChatID, StepIdle)
 		return
 	}
 
 	a.db.SetSetupState(userID, groupChatID, StepIdle)
-	a.send(chatID, fmt.Sprintf("File uploaded to knowledge base! (ID: %d)\n\nFilename: %s\nSize: %s\n\nUse /list_knowledge to see all entries or /add_knowledge to upload more.",
+	a.send(chatID, fmt.Sprintf(MsgFileUploaded,
 		k.ID, doc.FileName, formatFileSize(int64(len(fileBytes)))))
 }
 
@@ -770,12 +716,12 @@ func (a *Agent) handleKnowledgeURL(chatID, userID, groupChatID int64, url string
 		url = "https://" + url
 	}
 
-	a.send(chatID, "Fetching content from URL...")
+	a.send(chatID, MsgFetchingURL)
 
 	httpClient := &http.Client{}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		a.send(chatID, "Invalid URL. Please try again with /add_url")
+		a.send(chatID, MsgInvalidURL)
 		a.db.SetSetupState(userID, groupChatID, StepIdle)
 		return
 	}
@@ -783,7 +729,7 @@ func (a *Agent) handleKnowledgeURL(chatID, userID, groupChatID int64, url string
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		a.send(chatID, fmt.Sprintf("Failed to fetch URL: %v\n\nTry again with /add_url", err))
+		a.send(chatID, fmt.Sprintf(MsgFailedFetchURL, err))
 		a.db.SetSetupState(userID, groupChatID, StepIdle)
 		return
 	}
@@ -791,7 +737,7 @@ func (a *Agent) handleKnowledgeURL(chatID, userID, groupChatID int64, url string
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 100*1024))
 	if err != nil {
-		a.send(chatID, "Failed to read URL content. Try again with /add_url")
+		a.send(chatID, MsgFailedReadURL)
 		a.db.SetSetupState(userID, groupChatID, StepIdle)
 		return
 	}
@@ -803,18 +749,18 @@ func (a *Agent) handleKnowledgeURL(chatID, userID, groupChatID int64, url string
 	}
 
 	if strings.TrimSpace(content) == "" {
-		a.send(chatID, "Could not extract text from that URL. Try a different URL or use /add_knowledge to upload a file instead.")
+		a.send(chatID, MsgNoTextFromURL)
 		a.db.SetSetupState(userID, groupChatID, StepIdle)
 		return
 	}
 
-	a.send(chatID, "Uploading to knowledge base...")
+	a.send(chatID, MsgUploadingKB)
 
 	ctx := context.Background()
 	vsID, err := a.ensureVectorStore(ctx, groupChatID)
 	if err != nil {
 		log.Printf("[Agent] Error ensuring vector store: %v", err)
-		a.send(chatID, "Error creating knowledge store. Please try again.")
+		a.send(chatID, MsgErrorKnowledgeStore)
 		a.db.SetSetupState(userID, groupChatID, StepIdle)
 		return
 	}
@@ -823,7 +769,7 @@ func (a *Agent) handleKnowledgeURL(chatID, userID, groupChatID int64, url string
 	fileID, err := client.UploadTextAsFile(ctx, vsID, url, content)
 	if err != nil {
 		log.Printf("[Agent] Error uploading URL knowledge: %v", err)
-		a.send(chatID, "Error uploading knowledge. Please try again.")
+		a.send(chatID, MsgErrorUploadURL)
 		a.db.SetSetupState(userID, groupChatID, StepIdle)
 		return
 	}
@@ -838,26 +784,26 @@ func (a *Agent) handleKnowledgeURL(chatID, userID, groupChatID int64, url string
 	}
 	if err := a.db.AddKnowledge(k); err != nil {
 		log.Printf("[Agent] Error adding URL knowledge to DB: %v", err)
-		a.send(chatID, "Error saving knowledge record.")
+		a.send(chatID, MsgErrorSaveRecord)
 		a.db.SetSetupState(userID, groupChatID, StepIdle)
 		return
 	}
 
 	a.db.SetSetupState(userID, groupChatID, StepIdle)
-	a.send(chatID, fmt.Sprintf("Knowledge from URL added! (ID: %d)\n\nSource: %s\nContent preview: %s\n\nUse /list_knowledge to see all entries.",
+	a.send(chatID, fmt.Sprintf(MsgURLKnowledgeAdded,
 		k.ID, url, truncateStr(content, 200)))
 }
 
 func (a *Agent) sendKnowledgeList(chatID, userID int64) {
 	groupChatID := a.getSelectedGroupChatID(userID)
 	if groupChatID == 0 {
-		a.send(chatID, "No group selected. Use /setup to select a group first.")
+		a.send(chatID, MsgNoGroupSelected)
 		return
 	}
 
 	items, err := a.db.ListKnowledge(groupChatID)
 	if err != nil || len(items) == 0 {
-		a.send(chatID, "No knowledge entries yet.\n\nUse /add_knowledge to upload a file or /add_url to add from a URL.")
+		a.send(chatID, MsgErrorKnowledgeNone)
 		return
 	}
 
@@ -867,7 +813,7 @@ func (a *Agent) sendKnowledgeList(chatID, userID int64) {
 			k.ID, k.SourceType, k.Title, truncateStr(k.Content, 80)))
 	}
 
-	text := fmt.Sprintf("Knowledge Base (%d entries)\n\n%s\n\nTo delete: /delete_knowledge <id>",
+	text := fmt.Sprintf(MsgKnowledgeListFmt,
 		len(items), strings.Join(lines, "\n\n"))
 	a.send(chatID, text)
 }
@@ -875,25 +821,25 @@ func (a *Agent) sendKnowledgeList(chatID, userID int64) {
 func (a *Agent) handleDeleteKnowledge(chatID, userID int64, text string) {
 	groupChatID := a.getSelectedGroupChatID(userID)
 	if groupChatID == 0 {
-		a.send(chatID, "No group selected. Use /setup to select a group first.")
+		a.send(chatID, MsgNoGroupSelected)
 		return
 	}
 
 	parts := strings.Fields(text)
 	if len(parts) < 2 {
-		a.send(chatID, "Usage: /delete_knowledge <id>\n\nUse /list_knowledge to see IDs.")
+		a.send(chatID, MsgDeleteUsage)
 		return
 	}
 
 	id, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
-		a.send(chatID, "Invalid ID. Use /list_knowledge to see valid IDs.")
+		a.send(chatID, MsgInvalidID)
 		return
 	}
 
 	k, err := a.db.GetKnowledge(id)
 	if err != nil || k.ChatID != groupChatID {
-		a.send(chatID, "Knowledge entry not found.")
+		a.send(chatID, MsgKnowledgeNotFound)
 		return
 	}
 
@@ -910,17 +856,17 @@ func (a *Agent) handleDeleteKnowledge(chatID, userID int64, text string) {
 	}
 
 	if err := a.db.DeleteKnowledge(id, groupChatID); err != nil {
-		a.send(chatID, "Error deleting knowledge entry.")
+		a.send(chatID, MsgErrorDeleteEntry)
 		return
 	}
 
-	a.send(chatID, fmt.Sprintf("Knowledge entry %d deleted (\"%s\").", id, truncateStr(k.Title, 50)))
+	a.send(chatID, fmt.Sprintf(MsgKnowledgeDeleted, id, truncateStr(k.Title, 50)))
 }
 
 // handleSaveCommand handles /save in group chats (reply to a message to save as knowledge)
 func (a *Agent) handleSaveCommand(msg *tgbotapi.Message) {
 	if msg.ReplyToMessage == nil || msg.ReplyToMessage.Text == "" {
-		reply := tgbotapi.NewMessage(msg.Chat.ID, "Reply to a message with /save to save it as knowledge.")
+		reply := tgbotapi.NewMessage(msg.Chat.ID, MsgSaveReply)
 		reply.ReplyToMessageID = msg.MessageID
 		a.bot.Send(reply)
 		return
@@ -935,7 +881,7 @@ func (a *Agent) handleSaveCommand(msg *tgbotapi.Message) {
 	groupCfg := a.getOrCreateGroupConfig(msg.Chat.ID)
 	limits := plan.GetLimits(groupCfg.Plan)
 	if !limits.KnowledgeUpload {
-		reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Knowledge uploads are not available on the %s plan. Upgrade to Pro or Max.", groupCfg.Plan.DisplayName()))
+		reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf(MsgKnowledgeNoUploadShort, groupCfg.Plan.DisplayName()))
 		reply.ReplyToMessageID = msg.MessageID
 		a.bot.Send(reply)
 		return
@@ -949,7 +895,7 @@ func (a *Agent) handleSaveCommand(msg *tgbotapi.Message) {
 	vsID, err := a.ensureVectorStore(ctx, msg.Chat.ID)
 	if err != nil {
 		log.Printf("[Agent] Error ensuring vector store for /save: %v", err)
-		reply := tgbotapi.NewMessage(msg.Chat.ID, "Error saving to knowledge base.")
+		reply := tgbotapi.NewMessage(msg.Chat.ID, MsgErrorSaveKB)
 		reply.ReplyToMessageID = msg.MessageID
 		a.bot.Send(reply)
 		return
@@ -959,7 +905,7 @@ func (a *Agent) handleSaveCommand(msg *tgbotapi.Message) {
 	fileID, err := client.UploadTextAsFile(ctx, vsID, title, content)
 	if err != nil {
 		log.Printf("[Agent] Error uploading saved message: %v", err)
-		reply := tgbotapi.NewMessage(msg.Chat.ID, "Error uploading to knowledge base.")
+		reply := tgbotapi.NewMessage(msg.Chat.ID, MsgErrorUploadKBChat)
 		reply.ReplyToMessageID = msg.MessageID
 		a.bot.Send(reply)
 		return
@@ -978,7 +924,7 @@ func (a *Agent) handleSaveCommand(msg *tgbotapi.Message) {
 		return
 	}
 
-	reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Saved to knowledge base (ID: %d)", k.ID))
+	reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf(MsgSavedToKB, k.ID))
 	reply.ReplyToMessageID = msg.MessageID
 	a.bot.Send(reply)
 }
