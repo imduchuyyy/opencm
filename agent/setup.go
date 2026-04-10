@@ -25,8 +25,6 @@ const (
 	StepTopics          = "topics"
 	StepMessageExamples = "message_examples"
 	StepChatStyle       = "chat_style"
-	StepModel           = "model"
-	StepPermissions     = "permissions"
 	StepKnowledgeFile   = "knowledge_file"
 	StepKnowledgeURL    = "knowledge_url"
 )
@@ -143,15 +141,6 @@ func (a *Agent) handleSetupCommand(msg *tgbotapi.Message, text string) {
 
 	case text == CmdSetStyle:
 		a.startConfigStep(chatID, userID, StepChatStyle, MsgPromptStyle)
-
-	case text == CmdSetModel:
-		a.startConfigStep(chatID, userID, StepModel, MsgPromptModel)
-
-	case text == CmdSetPermissions:
-		a.sendPermissionsMenu(chatID, userID)
-
-	case strings.HasPrefix(text, CmdPermPrefix):
-		a.handlePermissionToggle(msg, text)
 
 	case text == CmdAddKnowledge:
 		a.startKnowledgeStep(chatID, userID, StepKnowledgeFile, MsgPromptKnowledgeFile)
@@ -284,7 +273,6 @@ func (a *Agent) handleSetupInput(msg *tgbotapi.Message, text string) {
 		StepTopics:          "topics",
 		StepMessageExamples: "message_examples",
 		StepChatStyle:       "chat_style",
-		StepModel:           "model",
 	}
 
 	field, ok := fieldMap[state.Step]
@@ -395,111 +383,16 @@ func (a *Agent) sendCurrentConfig(chatID, userID int64) {
 		"Topics: %s\n\n"+
 		"Chat Style: %s\n\n"+
 		"Message Examples: %s\n\n"+
-		"Model: %s\n"+
-		"Vector Store: %s\n\n"+
-		"Permissions:\n"+
-		"  Reply: %s\n"+
-		"  Ban: %s\n"+
-		"  Pin: %s\n"+
-		"  Poll: %s\n"+
-		"  Delete: %s",
+		"Vector Store: %s",
 		groupTitle,
 		truncate(cfg.SystemPrompt, 200),
 		truncate(cfg.Bio, 200),
 		truncate(cfg.Topics, 200),
 		truncate(cfg.ChatStyle, 200),
 		truncate(cfg.MessageExamples, 200),
-		cfg.Model,
 		vectorStatus,
-		boolEmoji(cfg.CanReply),
-		boolEmoji(cfg.CanBan),
-		boolEmoji(cfg.CanPin),
-		boolEmoji(cfg.CanPoll),
-		boolEmoji(cfg.CanDelete),
 	)
 	a.send(chatID, text)
-}
-
-func (a *Agent) sendPermissionsMenu(chatID, userID int64) {
-	groupChatID := a.getSelectedGroupChatID(userID)
-	if groupChatID == 0 {
-		a.send(chatID, MsgNoGroupSelected)
-		return
-	}
-
-	cfg, err := a.db.GetGroupConfig(groupChatID)
-	if err != nil {
-		a.send(chatID, MsgSetupGroupFirst)
-		return
-	}
-
-	text := fmt.Sprintf("Bot Permissions\n\n"+
-		"Toggle permissions by sending the command:\n\n"+
-		CmdPermReply+" - Reply to messages [%s]\n"+
-		CmdPermBan+" - Ban/mute members [%s]\n"+
-		CmdPermPin+" - Pin messages [%s]\n"+
-		CmdPermPoll+" - Create polls [%s]\n"+
-		CmdPermDelete+" - Delete messages [%s]\n\n"+
-		"Note: The bot also needs the corresponding Telegram admin permissions in the group.",
-		boolEmoji(cfg.CanReply),
-		boolEmoji(cfg.CanBan),
-		boolEmoji(cfg.CanPin),
-		boolEmoji(cfg.CanPoll),
-		boolEmoji(cfg.CanDelete),
-	)
-	a.send(chatID, text)
-}
-
-func (a *Agent) handlePermissionToggle(msg *tgbotapi.Message, text string) {
-	chatID := msg.Chat.ID
-	userID := msg.From.ID
-
-	groupChatID := a.getSelectedGroupChatID(userID)
-	if groupChatID == 0 {
-		a.send(chatID, MsgNoGroupSelected)
-		return
-	}
-
-	if !a.isAdmin(groupChatID, userID) {
-		a.send(chatID, MsgNoLongerAdmin)
-		return
-	}
-
-	cfg, err := a.db.GetGroupConfig(groupChatID)
-	if err != nil {
-		a.send(chatID, MsgSetupGroupFirst)
-		return
-	}
-
-	permMap := map[string]struct {
-		field string
-		value bool
-	}{
-		CmdPermReply:  {"can_reply", !cfg.CanReply},
-		CmdPermBan:    {"can_ban", !cfg.CanBan},
-		CmdPermPin:    {"can_pin", !cfg.CanPin},
-		CmdPermPoll:   {"can_poll", !cfg.CanPoll},
-		CmdPermDelete: {"can_delete", !cfg.CanDelete},
-	}
-
-	perm, ok := permMap[text]
-	if !ok {
-		a.send(chatID, MsgUnknownPermission)
-		return
-	}
-
-	if err := a.db.UpdateGroupConfigBool(groupChatID, perm.field, perm.value); err != nil {
-		a.send(chatID, MsgErrorUpdatePerm)
-		return
-	}
-
-	status := "disabled"
-	if perm.value {
-		status = "enabled"
-	}
-
-	a.send(chatID, fmt.Sprintf(MsgPermToggled, perm.field, status))
-	a.sendPermissionsMenu(chatID, userID)
 }
 
 func (a *Agent) sendGroupsList(chatID, userID int64) {
@@ -574,13 +467,6 @@ func (a *Agent) sendHelp(chatID int64) {
 	a.send(chatID, MsgHelp)
 }
 
-func boolEmoji(b bool) string {
-	if b {
-		return "ON"
-	}
-	return "OFF"
-}
-
 func stepDisplayName(step string) string {
 	names := map[string]string{
 		StepSystemPrompt:    "System Prompt",
@@ -588,7 +474,6 @@ func stepDisplayName(step string) string {
 		StepTopics:          "Topics",
 		StepMessageExamples: "Message Examples",
 		StepChatStyle:       "Chat Style",
-		StepModel:           "Model",
 	}
 	if name, ok := names[step]; ok {
 		return name
@@ -861,72 +746,6 @@ func (a *Agent) handleDeleteKnowledge(chatID, userID int64, text string) {
 	}
 
 	a.send(chatID, fmt.Sprintf(MsgKnowledgeDeleted, id, truncateStr(k.Title, 50)))
-}
-
-// handleSaveCommand handles /save in group chats (reply to a message to save as knowledge)
-func (a *Agent) handleSaveCommand(msg *tgbotapi.Message) {
-	if msg.ReplyToMessage == nil || msg.ReplyToMessage.Text == "" {
-		reply := tgbotapi.NewMessage(msg.Chat.ID, MsgSaveReply)
-		reply.ReplyToMessageID = msg.MessageID
-		a.bot.Send(reply)
-		return
-	}
-
-	// Check if sender is an admin of this group
-	if !a.isAdmin(msg.Chat.ID, msg.From.ID) {
-		return // Silently ignore non-admin
-	}
-
-	// Check plan allows knowledge uploads
-	groupCfg := a.getOrCreateGroupConfig(msg.Chat.ID)
-	limits := plan.GetLimits(groupCfg.Plan)
-	if !limits.KnowledgeUpload {
-		reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf(MsgKnowledgeNoUploadShort, groupCfg.Plan.DisplayName()))
-		reply.ReplyToMessageID = msg.MessageID
-		a.bot.Send(reply)
-		return
-	}
-
-	savedMsg := msg.ReplyToMessage
-	title := fmt.Sprintf("Chat message from %s", savedMsg.From.FirstName)
-	content := savedMsg.Text
-
-	ctx := context.Background()
-	vsID, err := a.ensureVectorStore(ctx, msg.Chat.ID)
-	if err != nil {
-		log.Printf("[Agent] Error ensuring vector store for /save: %v", err)
-		reply := tgbotapi.NewMessage(msg.Chat.ID, MsgErrorSaveKB)
-		reply.ReplyToMessageID = msg.MessageID
-		a.bot.Send(reply)
-		return
-	}
-
-	client := a.getLLMClient()
-	fileID, err := client.UploadTextAsFile(ctx, vsID, title, content)
-	if err != nil {
-		log.Printf("[Agent] Error uploading saved message: %v", err)
-		reply := tgbotapi.NewMessage(msg.Chat.ID, MsgErrorUploadKBChat)
-		reply.ReplyToMessageID = msg.MessageID
-		a.bot.Send(reply)
-		return
-	}
-
-	k := &database.Knowledge{
-		ChatID:       msg.Chat.ID,
-		SourceType:   "chat",
-		Title:        title,
-		Content:      truncateStr(content, 500),
-		OpenAIFileID: fileID,
-		AddedBy:      msg.From.ID,
-	}
-	if err := a.db.AddKnowledge(k); err != nil {
-		log.Printf("[Agent] Error saving chat knowledge: %v", err)
-		return
-	}
-
-	reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf(MsgSavedToKB, k.ID))
-	reply.ReplyToMessageID = msg.MessageID
-	a.bot.Send(reply)
 }
 
 // ----- Helpers -----

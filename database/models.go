@@ -16,16 +16,9 @@ type GroupConfig struct {
 	Topics          string    `json:"topics"`
 	MessageExamples string    `json:"message_examples"`
 	ChatStyle       string    `json:"chat_style"`
-	Model           string    `json:"model"`           // OpenAI model (gpt-4o, etc.)
 	VectorStoreID   string    `json:"vector_store_id"` // OpenAI vector store ID for file search
-	// Permissions
-	CanReply  bool      `json:"can_reply"`
-	CanBan    bool      `json:"can_ban"`
-	CanPin    bool      `json:"can_pin"`
-	CanPoll   bool      `json:"can_poll"`
-	CanDelete bool      `json:"can_delete"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // Group tracks which groups the bot has been added to

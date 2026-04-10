@@ -40,13 +40,7 @@ func (db *DB) migrate() error {
 			topics TEXT NOT NULL DEFAULT '',
 			message_examples TEXT NOT NULL DEFAULT '',
 			chat_style TEXT NOT NULL DEFAULT 'friendly and helpful',
-			model TEXT NOT NULL DEFAULT 'gpt-4o',
 			vector_store_id TEXT NOT NULL DEFAULT '',
-			can_reply BOOLEAN NOT NULL DEFAULT 1,
-			can_ban BOOLEAN NOT NULL DEFAULT 0,
-			can_pin BOOLEAN NOT NULL DEFAULT 0,
-			can_poll BOOLEAN NOT NULL DEFAULT 0,
-			can_delete BOOLEAN NOT NULL DEFAULT 0,
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
@@ -139,8 +133,8 @@ func (db *DB) migrate() error {
 
 func (db *DB) UpsertGroupConfig(cfg *GroupConfig) error {
 	_, err := db.conn.Exec(
-		`INSERT INTO group_configs (chat_id, plan, system_prompt, bio, topics, message_examples, chat_style, model, vector_store_id, can_reply, can_ban, can_pin, can_poll, can_delete)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO group_configs (chat_id, plan, system_prompt, bio, topics, message_examples, chat_style, vector_store_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(chat_id) DO UPDATE SET
 			plan=excluded.plan,
 			system_prompt=excluded.system_prompt,
@@ -148,17 +142,10 @@ func (db *DB) UpsertGroupConfig(cfg *GroupConfig) error {
 			topics=excluded.topics,
 			message_examples=excluded.message_examples,
 			chat_style=excluded.chat_style,
-			model=excluded.model,
 			vector_store_id=excluded.vector_store_id,
-			can_reply=excluded.can_reply,
-			can_ban=excluded.can_ban,
-			can_pin=excluded.can_pin,
-			can_poll=excluded.can_poll,
-			can_delete=excluded.can_delete,
 			updated_at=CURRENT_TIMESTAMP`,
 		cfg.ChatID, string(cfg.Plan), cfg.SystemPrompt, cfg.Bio, cfg.Topics, cfg.MessageExamples, cfg.ChatStyle,
-		cfg.Model, cfg.VectorStoreID,
-		cfg.CanReply, cfg.CanBan, cfg.CanPin, cfg.CanPoll, cfg.CanDelete,
+		cfg.VectorStoreID,
 	)
 	return err
 }
@@ -167,12 +154,11 @@ func (db *DB) GetGroupConfig(chatID int64) (*GroupConfig, error) {
 	cfg := &GroupConfig{}
 	var planStr string
 	err := db.conn.QueryRow(
-		`SELECT id, chat_id, plan, system_prompt, bio, topics, message_examples, chat_style, model, vector_store_id,
-			can_reply, can_ban, can_pin, can_poll, can_delete, created_at, updated_at
+		`SELECT id, chat_id, plan, system_prompt, bio, topics, message_examples, chat_style, vector_store_id,
+			created_at, updated_at
 		 FROM group_configs WHERE chat_id = ?`, chatID,
 	).Scan(&cfg.ID, &cfg.ChatID, &planStr, &cfg.SystemPrompt, &cfg.Bio, &cfg.Topics, &cfg.MessageExamples, &cfg.ChatStyle,
-		&cfg.Model, &cfg.VectorStoreID,
-		&cfg.CanReply, &cfg.CanBan, &cfg.CanPin, &cfg.CanPoll, &cfg.CanDelete,
+		&cfg.VectorStoreID,
 		&cfg.CreatedAt, &cfg.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -188,20 +174,7 @@ func (db *DB) UpdateGroupConfigField(chatID int64, field, value string) error {
 	allowed := map[string]bool{
 		"system_prompt": true, "bio": true, "topics": true,
 		"message_examples": true, "chat_style": true,
-		"model": true, "vector_store_id": true,
-	}
-	if !allowed[field] {
-		return fmt.Errorf("unknown field: %s", field)
-	}
-	query := fmt.Sprintf(`UPDATE group_configs SET %s = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?`, field)
-	_, err := db.conn.Exec(query, value, chatID)
-	return err
-}
-
-func (db *DB) UpdateGroupConfigBool(chatID int64, field string, value bool) error {
-	allowed := map[string]bool{
-		"can_reply": true, "can_ban": true, "can_pin": true,
-		"can_poll": true, "can_delete": true,
+		"vector_store_id": true,
 	}
 	if !allowed[field] {
 		return fmt.Errorf("unknown field: %s", field)

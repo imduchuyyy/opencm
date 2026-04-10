@@ -72,6 +72,17 @@ func (a *Agent) sendThinking(chatID int64) int {
 	return sent.MessageID
 }
 
+// updateThinking edits the thinking message to show current activity. No-op if messageID is 0.
+func (a *Agent) updateThinking(chatID int64, messageID int, text string) {
+	if messageID == 0 {
+		return
+	}
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	if _, err := a.bot.Send(edit); err != nil {
+		log.Printf("[Agent] Failed to update thinking message: %v", err)
+	}
+}
+
 // deleteThinking deletes the "Thinking..." message. No-op if messageID is 0.
 func (a *Agent) deleteThinking(chatID int64, messageID int) {
 	if messageID == 0 {
@@ -218,12 +229,6 @@ func (a *Agent) handleUpdate(update tgbotapi.Update) {
 		if msg.From != nil {
 			a.db.UpsertGroupMember(msg.Chat.ID, msg.From.ID)
 		}
-	}
-
-	// Handle /save command in groups
-	if msg.Text == "/save" || strings.HasPrefix(msg.Text, "/save@") {
-		a.handleSaveCommand(msg)
-		return
 	}
 
 	// Store ALL group messages in the database
@@ -432,9 +437,7 @@ func (a *Agent) getOrCreateGroupConfig(chatID int64) *database.GroupConfig {
 	cfg = &database.GroupConfig{
 		ChatID:    chatID,
 		Plan:      plan.Free,
-		Model:     a.appConfig.DefaultModel,
 		ChatStyle: "friendly and helpful",
-		CanReply:  true,
 	}
 	a.db.UpsertGroupConfig(cfg)
 	return cfg
@@ -517,11 +520,8 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 	// Fetch group context
 	groupCtx := a.fetchGroupContext(chatID)
 
-	// Determine model
-	model := groupCfg.Model
-	if model == "" {
-		model = a.appConfig.DefaultModel
-	}
+	// Use the global default model
+	model := a.appConfig.DefaultModel
 
 	apiKey := a.appConfig.OpenAIAPIKey
 	if apiKey == "" {
@@ -540,7 +540,7 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 	userMessages := buildUserMessages(recentMsgs, msgs, replyContext, mediaURLs)
 
 	// Get available tools
-	availableTools := tools.GetAvailableTools(groupCfg)
+	availableTools := tools.GetAvailableTools()
 
 	// Send "Thinking..." indicator
 	thinkingMsgID := a.sendThinking(chatID)
@@ -554,13 +554,18 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 	}
 
 	// Tool execution loop
-	executor := tools.NewExecutor(a.bot, groupCfg, a.db, chatID, a.appConfig.LangSearchAPIKey)
+	executor := tools.NewExecutor(a.bot, a.db, chatID, a.appConfig.LangSearchAPIKey)
 	var allResults []string
 	maxIterations := 5
 
 	for i := 0; i < maxIterations; i++ {
 		if len(response.ToolCalls) == 0 {
 			break
+		}
+
+		// Update thinking message to show what the agent is doing
+		if status := toolStatusText(response.ToolCalls); status != "" {
+			a.updateThinking(chatID, thinkingMsgID, status)
 		}
 
 		var toolResults []llm.ToolResult
@@ -614,6 +619,39 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 	if err := a.db.MarkMessagesProcessed(ids, aiResponseSummary); err != nil {
 		log.Printf("[Agent] Error marking messages processed: %v", err)
 	}
+}
+
+// toolStatusText returns a user-friendly status string for the current tool calls
+func toolStatusText(toolCalls []llm.ToolCall) string {
+	displayNames := map[string]string{
+		"web_search":   "Searching the web...",
+		"web_fetch":    "Reading a webpage...",
+		"send_message": "Sending message...",
+		"send_poll":    "Creating poll...",
+		"get_config":   "Reading configuration...",
+		"set_config":   "Updating configuration...",
+	}
+
+	// If there's a single tool call, show its specific status
+	if len(toolCalls) == 1 {
+		if name, ok := displayNames[toolCalls[0].Name]; ok {
+			return name
+		}
+		return "Working..."
+	}
+
+	// Multiple tool calls - show the most interesting one
+	// Priority: web_search > web_fetch > others
+	priority := []string{"web_search", "web_fetch", "send_poll", "set_config"}
+	for _, p := range priority {
+		for _, tc := range toolCalls {
+			if tc.Name == p {
+				return displayNames[p]
+			}
+		}
+	}
+
+	return "Working..."
 }
 
 // formatMessageLine formats a single database message into a text line for the LLM
@@ -769,7 +807,6 @@ func buildSystemPrompt(cfg *database.GroupConfig, gc *GroupContext, botUsername,
 - When mentioned or replied to, respond helpfully and in character.
 - Be natural and conversational, not robotic.
 - When replying, always include the correct chat_id and reply_to_message_id to reply to the message that mentioned you or the latest message in the thread.
-- For moderation actions (ban, mute, delete), only act on clear violations and only if asked by an admin.
 - You can call multiple tools in one response.
 - You have access to get_config and set_config tools. Only group admins can change your configuration. If a non-admin tries to change settings, politely decline.`, botUsername, botFirstName))
 
