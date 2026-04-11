@@ -625,49 +625,18 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 		return
 	}
 
-	// Get last 10 messages for context
-	recentMsgs, _ := a.db.GetRecentMessages(chatID, 10)
-
-	// Remove any messages from recent history that are also in the new batch
-	// to avoid sending duplicates to the LLM
-	newMsgIDs := make(map[int64]bool)
-	for _, m := range msgs {
-		newMsgIDs[m.ID] = true
-	}
-	var filteredRecent []*database.Message
-	for _, m := range recentMsgs {
-		if !newMsgIDs[m.ID] {
-			filteredRecent = append(filteredRecent, m)
-		}
-	}
-	recentMsgs = filteredRecent
-
-	// Collect recent message IDs
-	recentMsgIDs := make(map[int]bool)
-	for _, m := range recentMsgs {
-		recentMsgIDs[m.MessageID] = true
-	}
-
-	// Walk reply chains
+	// Get the direct reply-to message for immediate context (if any new message is a reply)
 	var replyContext []*database.Message
 	seenReplyIDs := make(map[int]bool)
-	var collectReplies func(messages []*database.Message)
-	collectReplies = func(messages []*database.Message) {
-		for _, m := range messages {
-			if m.ReplyToMessageID > 0 && !recentMsgIDs[m.ReplyToMessageID] && !seenReplyIDs[m.ReplyToMessageID] {
-				seenReplyIDs[m.ReplyToMessageID] = true
-				repliedMsg, err := a.db.GetMessageByTelegramID(chatID, m.ReplyToMessageID)
-				if err == nil {
-					replyContext = append(replyContext, repliedMsg)
-					if len(replyContext) < 10 {
-						collectReplies([]*database.Message{repliedMsg})
-					}
-				}
+	for _, m := range msgs {
+		if m.ReplyToMessageID > 0 && !seenReplyIDs[m.ReplyToMessageID] {
+			seenReplyIDs[m.ReplyToMessageID] = true
+			repliedMsg, err := a.db.GetMessageByTelegramID(chatID, m.ReplyToMessageID)
+			if err == nil {
+				replyContext = append(replyContext, repliedMsg)
 			}
 		}
 	}
-	collectReplies(recentMsgs)
-	collectReplies(msgs)
 
 	// Fetch group context
 	groupCtx := a.fetchGroupContext(chatID)
@@ -685,9 +654,9 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 	systemPrompt := buildSystemPrompt(groupCfg, groupCtx, a.bot.Self.UserName, a.bot.Self.FirstName)
 
 	// Resolve image URLs from Telegram for vision-compatible media
-	mediaURLs := a.resolveMediaURLs(recentMsgs, msgs, replyContext)
+	mediaURLs := a.resolveMediaURLs(msgs, replyContext)
 
-	userMessages := buildUserMessages(recentMsgs, msgs, replyContext, mediaURLs)
+	userMessages := buildUserMessages(msgs, replyContext, mediaURLs)
 
 	// Get available tools based on plan
 	availableTools := tools.GetAvailableTools(limits)
@@ -707,7 +676,7 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 	}
 
 	// Tool execution loop
-	executor := tools.NewExecutor(a.bot, a.db, chatID, a.appConfig.LangSearchAPIKey, limits)
+	executor := tools.NewExecutor(a.bot, a.db, chatID, a.appConfig.LangSearchAPIKey, a.appConfig.OpenAIAPIKey, limits)
 	var allResults []string
 	maxIterations := 5
 
@@ -776,11 +745,12 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 // toolStatusText returns a user-friendly status string for the current tool calls
 func toolStatusText(toolCalls []llm.ToolCall) string {
 	displayNames := map[string]string{
-		"web_search": "Searching the web...",
-		"web_fetch":  "Reading a webpage...",
-		"send_poll":  "Creating poll...",
-		"get_config": "Reading configuration...",
-		"set_config": "Updating configuration...",
+		"web_search":          "Searching the web...",
+		"web_fetch":           "Reading a webpage...",
+		"search_chat_history": "Searching chat history...",
+		"send_poll":           "Creating poll...",
+		"get_config":          "Reading configuration...",
+		"set_config":          "Updating configuration...",
 	}
 
 	// If there's a single tool call, show its specific status
@@ -793,7 +763,7 @@ func toolStatusText(toolCalls []llm.ToolCall) string {
 
 	// Multiple tool calls - show the most interesting one
 	// Priority: web_search > web_fetch > others
-	priority := []string{"web_search", "web_fetch", "send_poll", "set_config"}
+	priority := []string{"web_search", "web_fetch", "search_chat_history", "send_poll", "set_config"}
 	for _, p := range priority {
 		for _, tc := range toolCalls {
 			if tc.Name == p {
@@ -880,17 +850,12 @@ func buildSectionMessages(msgs []*database.Message, mediaURLs map[int]string, he
 }
 
 // buildUserMessages constructs the user messages for the LLM.
-func buildUserMessages(history []*database.Message, newMsgs []*database.Message, replyContext []*database.Message, mediaURLs map[int]string) []llm.InputMessage {
+func buildUserMessages(newMsgs []*database.Message, replyContext []*database.Message, mediaURLs map[int]string) []llm.InputMessage {
 	var messages []llm.InputMessage
 
 	if len(replyContext) > 0 {
 		messages = append(messages,
-			buildSectionMessages(replyContext, mediaURLs, "=== REFERENCED MESSAGES (older messages that are being replied to) ===", false)...)
-	}
-
-	if len(history) > 0 {
-		messages = append(messages,
-			buildSectionMessages(history, mediaURLs, "=== RECENT CHAT HISTORY (last 10 messages for context) ===", false)...)
+			buildSectionMessages(replyContext, mediaURLs, "=== REFERENCED MESSAGES (messages being replied to) ===", false)...)
 	}
 
 	newSectionMsgs := buildSectionMessages(newMsgs, mediaURLs, "=== NEW MESSAGES (you were mentioned or replied to) ===", true)
@@ -898,7 +863,7 @@ func buildUserMessages(history []*database.Message, newMsgs []*database.Message,
 
 	if len(messages) > 0 {
 		last := &messages[len(messages)-1]
-		last.Text += "\n\nYou were mentioned or someone replied to your message. Decide what actions to take. You can call multiple tools."
+		last.Text += "\n\nYou were mentioned or someone replied to your message. Decide what actions to take. You can call multiple tools. If you need context from earlier conversation, use the search_chat_history tool."
 	}
 
 	return messages
@@ -965,9 +930,15 @@ func buildSystemPrompt(cfg *database.GroupConfig, gc *GroupContext, botUsername,
 
 	parts = append(parts, `## Tool Usage Rules
 - Your text output IS your reply. It will be sent directly to the chat as a message. Just write your response naturally.
-- You can also call tools (web_search, web_fetch, send_poll, get_config, set_config) when needed. After tools run, you'll get their results and can write your final response.
+- You can also call tools (web_search, web_fetch, search_chat_history, send_poll, get_config, set_config) when needed. After tools run, you'll get their results and can write your final response.
 - If you use tools, your final text output after all tool calls is what gets sent to the chat.
 - You can use Markdown formatting in your responses.`)
+
+	parts = append(parts, `## Chat History Search
+- You have a search_chat_history tool that searches recent chat messages using a sub-agent.
+- Use it when someone asks about something that was discussed earlier, references a past conversation, or when you need context you don't have.
+- Do NOT use it for every message. Only use it when you genuinely need historical context.
+- The tool searches the last ~50 messages with text content.`)
 
 	parts = append(parts, `## Knowledge Base (file_search)
 - You have access to a file_search tool that searches uploaded knowledge documents.

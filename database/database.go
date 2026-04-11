@@ -306,6 +306,42 @@ func (db *DB) GetMessageByTelegramID(chatID int64, messageID int) (*Message, err
 	return msg, nil
 }
 
+// SearchMessages returns recent messages for a chat, used by the search_chat_history sub-agent.
+// Returns messages in chronological order (oldest first).
+func (db *DB) SearchMessages(chatID int64, limit int) ([]*Message, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	rows, err := db.conn.Query(
+		`SELECT id, chat_id, chat_type, message_id, reply_to_message_id, from_user_id, from_username, from_first_name, text, media_type, media_file_id, is_processed, ai_response, created_at
+		 FROM messages WHERE chat_id = ? AND text != '' ORDER BY created_at DESC LIMIT ?`,
+		chatID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []*Message
+	for rows.Next() {
+		msg := &Message{}
+		if err := rows.Scan(&msg.ID, &msg.ChatID, &msg.ChatType, &msg.MessageID, &msg.ReplyToMessageID,
+			&msg.FromUserID, &msg.FromUsername, &msg.FromFirstName, &msg.Text, &msg.MediaType, &msg.MediaFileID,
+			&msg.IsProcessed, &msg.AIResponse, &msg.CreatedAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, msg)
+	}
+	// Reverse to chronological order
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+	return msgs, nil
+}
+
 // ----- Group CRUD -----
 
 func (db *DB) UpsertGroup(g *Group) error {

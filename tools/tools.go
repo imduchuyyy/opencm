@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,11 +21,12 @@ type Executor struct {
 	db               *database.DB
 	chatID           int64 // The group chat being processed
 	langSearchAPIKey string
+	openaiAPIKey     string // For sub-agent (search_chat_history)
 	limits           plan.Limits
 }
 
-func NewExecutor(bot *tgbotapi.BotAPI, db *database.DB, chatID int64, langSearchAPIKey string, limits plan.Limits) *Executor {
-	return &Executor{bot: bot, db: db, chatID: chatID, langSearchAPIKey: langSearchAPIKey, limits: limits}
+func NewExecutor(bot *tgbotapi.BotAPI, db *database.DB, chatID int64, langSearchAPIKey, openaiAPIKey string, limits plan.Limits) *Executor {
+	return &Executor{bot: bot, db: db, chatID: chatID, langSearchAPIKey: langSearchAPIKey, openaiAPIKey: openaiAPIKey, limits: limits}
 }
 
 // GetAvailableTools returns all tool definitions for the agent.
@@ -104,6 +106,21 @@ func GetAvailableTools(limits plan.Limits) []llm.ToolDef {
 
 	// Config tools - always available, admin enforcement happens in executor via Telegram API
 	tools = append(tools, llm.ToolDef{
+		Name:        "search_chat_history",
+		Description: "Search recent chat history for messages relevant to a topic or question. Use this when you need context from previous conversations to answer a question properly. A sub-agent will sift through recent messages and return only the relevant ones. Do NOT use this for every message - only when you genuinely need historical context that isn't in the current conversation.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "A description of what to search for in chat history (e.g. 'discussion about token launch date', 'questions about staking rewards')",
+				},
+			},
+			"required": []string{"query"},
+		},
+	})
+
+	tools = append(tools, llm.ToolDef{
 		Name:        "get_config",
 		Description: "Get the current bot configuration for this group. Returns system_prompt, bio, topics, chat_style, and message_examples.",
 		Parameters: map[string]interface{}{
@@ -147,6 +164,8 @@ func (e *Executor) Execute(tc llm.ToolCall) (string, error) {
 		return e.webSearch(tc.Arguments)
 	case "web_fetch":
 		return e.webFetch(tc.Arguments)
+	case "search_chat_history":
+		return e.searchChatHistory(tc.Arguments)
 	case "get_config":
 		return e.getConfig()
 	case "set_config":
@@ -415,6 +434,76 @@ func (e *Executor) setConfig(args map[string]interface{}) (string, error) {
 	}
 
 	return fmt.Sprintf("Unknown config field: %s. Available fields: system_prompt, bio, topics, chat_style, message_examples", field), nil
+}
+
+// ----- Chat History Search (sub-agent) -----
+
+func (e *Executor) searchChatHistory(args map[string]interface{}) (string, error) {
+	query, _ := args["query"].(string)
+	if query == "" {
+		return "", fmt.Errorf("query is required")
+	}
+
+	// Fetch recent messages from DB (last 50 with text content)
+	msgs, err := e.db.SearchMessages(e.chatID, 50)
+	if err != nil {
+		return "", fmt.Errorf("search messages: %w", err)
+	}
+	if len(msgs) == 0 {
+		return "No chat history available for this group.", nil
+	}
+
+	// Format messages for the sub-agent
+	var lines []string
+	for _, msg := range msgs {
+		name := msg.FromFirstName
+		if name == "" {
+			name = msg.FromUsername
+		}
+		line := fmt.Sprintf("[%s, MsgID:%d] %s (@%s): %s",
+			msg.CreatedAt.Format("2006-01-02 15:04"), msg.MessageID, name, msg.FromUsername, msg.Text)
+		if msg.ReplyToMessageID > 0 {
+			line = fmt.Sprintf("[%s, MsgID:%d, ReplyTo:%d] %s (@%s): %s",
+				msg.CreatedAt.Format("2006-01-02 15:04"), msg.MessageID, msg.ReplyToMessageID, name, msg.FromUsername, msg.Text)
+		}
+		lines = append(lines, line)
+	}
+	chatLog := strings.Join(lines, "\n")
+
+	// Call gpt-4o-mini as a sub-agent to filter for relevant messages
+	subClient := llm.NewClient(e.openaiAPIKey, "gpt-4o-mini")
+
+	systemPrompt := `You are a chat history search assistant. You will be given a chat log and a search query. Your job is to find and return ONLY the messages that are relevant to the query.
+
+Rules:
+- Return the relevant messages exactly as they appear (preserve the format)
+- If multiple messages form a conversation thread about the topic, include all of them
+- If no messages are relevant, say "No relevant messages found."
+- Do NOT add commentary or explanations. Just return the matching messages.
+- Return at most 15 messages to keep context manageable.`
+
+	userMsg := fmt.Sprintf("Search query: %s\n\nChat log:\n%s", query, chatLog)
+	userMessages := []llm.InputMessage{{Text: userMsg}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := subClient.Chat(ctx, systemPrompt, userMessages, nil, "")
+	if err != nil {
+		return "", fmt.Errorf("sub-agent search: %w", err)
+	}
+
+	result := strings.TrimSpace(resp.Text)
+	if result == "" {
+		return "No relevant messages found in chat history.", nil
+	}
+
+	// Truncate if too long
+	if len(result) > 4000 {
+		result = result[:4000] + "\n... (truncated)"
+	}
+
+	return fmt.Sprintf("Chat history search results for \"%s\":\n\n%s", query, result), nil
 }
 
 // ----- Helpers -----
