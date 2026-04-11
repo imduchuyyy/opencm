@@ -16,8 +16,16 @@ const (
 	CmdDeleteKnowledge = "/delete_knowledge"
 	CmdGroups          = "/groups"
 	CmdPlan            = "/plan"
+	CmdSubscribePro    = "/subscribe_pro"
+	CmdSubscribeMax    = "/subscribe_max"
 	CmdHelp            = "/help"
 	CmdCancel          = "/cancel"
+
+	// Super admin commands
+	CmdAdminSearch  = "/admin_search"
+	CmdAdminSetPlan = "/admin_set_plan"
+	CmdAdminSelect  = "/admin_select"
+	CmdAdminHelp    = "/admin_help"
 )
 
 // User-facing message constants
@@ -57,7 +65,7 @@ const (
 	MsgUnsupportedFileType  = "Unsupported file type: %s\n\nPlease send a PDF, Markdown (.md), or Text (.txt) file."
 	MsgFileTooLarge         = "File is too large (max %s on the %s plan). Please send a smaller file."
 	MsgDownloading          = "Downloading %s..."
-	MsgKnowledgeNoUpload    = "Knowledge uploads are not available on the %s plan.\n\nUpgrade to Pro or Max to use the knowledge base."
+	MsgKnowledgeNoUpload    = "Knowledge uploads are not available on the %s plan.\n\nUpgrade to Max to use the knowledge base. Use " + CmdSubscribeMax + " to upgrade."
 	MsgFieldUpdated         = "%s updated successfully!\n\nUse " + CmdConfig + " to see current configuration or " + CmdSetup + " to continue configuring."
 	MsgInvalidGroupNum      = "Please send a number between 1 and %d."
 	MsgGroupSelected        = "Selected group: %s\n\nYou can now configure the bot for this group. Use " + CmdSetup + " to see the menu, or use any command directly."
@@ -116,6 +124,10 @@ const (
 		CmdAddKnowledge + " - Upload a file (PDF, .md, .txt)\n" +
 		CmdAddURL + " - Add knowledge from a URL\n" +
 		CmdListKnowledge + " - View all knowledge entries\n\n" +
+		"Subscription:\n" +
+		CmdPlan + " - View plan and usage\n" +
+		CmdSubscribePro + " - Upgrade to Pro ($19/mo)\n" +
+		CmdSubscribeMax + " - Upgrade to Max ($49/mo)\n\n" +
 		CmdConfig + " - View current configuration\n" +
 		CmdGroups + " - View groups I'm in where you're admin\n" +
 		CmdSetup + " - Switch to a different group"
@@ -135,8 +147,55 @@ const (
 		CmdAddURL + " - Add knowledge from URL\n" +
 		CmdListKnowledge + " - List all knowledge\n" +
 		CmdDeleteKnowledge + " <id> - Delete a knowledge entry\n\n" +
+		"Subscription:\n" +
+		CmdPlan + " - View plan and usage\n" +
+		CmdSubscribePro + " - Upgrade to Pro\n" +
+		CmdSubscribeMax + " - Upgrade to Max\n\n" +
 		"Info:\n" +
 		CmdGroups + " - View your admin groups\n" +
-		CmdPlan + " - View plan and usage\n" +
 		CmdHelp + " - Show this message"
+
+	// Payment-related messages
+	MsgPaymentSuccess          = "Payment successful! Your %s plan for %s is now active.\n\nPaid: %d Stars\nPeriod: 1 %s\nExpires: %s\n\nThank you for subscribing!"
+	MsgPaymentErrorGeneric     = "Something went wrong processing your payment. Please try again or contact support."
+	MsgPaymentInvalidPlan      = "Invalid plan. Use " + CmdSubscribePro + " or " + CmdSubscribeMax + " to subscribe."
+	MsgPaymentErrorSendInvoice = "Failed to create payment invoice. Please try again."
+	MsgAlreadyOnPlan           = "You are already on the %s plan for this group."
+
+	MsgPlanInfo = "Plan for: %s\n\n" +
+		"Current Plan: %s\n" +
+		"Status: %s\n\n" +
+		"Usage This Month: %d / %d messages\n" +
+		"Rate Limit: %d messages/min\n" +
+		"Web Search: %s\n" +
+		"Web Fetch: %s\n" +
+		"Knowledge Upload: %s\n\n" +
+		"Available Plans:\n" +
+		"  Free - 1,000 msgs/mo, bot config only\n" +
+		"  Pro ($19/mo or $190/yr) - 2,500 msgs/mo, web search, web fetch\n" +
+		"  Max ($49/mo or $490/yr) - 10,000 msgs/mo, all Pro features + knowledge (10MB)\n" +
+		"  Custom - Contact admin for pricing\n\n" +
+		"Upgrade:\n" +
+		"  " + CmdSubscribePro + " - Upgrade to Pro (~1,500 Stars/mo)\n" +
+		"  " + CmdSubscribeMax + " - Upgrade to Max (~3,750 Stars/mo)\n" +
+		"  Add 'yearly' for annual pricing (save ~17%%)"
+
+	// Super admin messages
+	MsgNotSuperAdmin       = "This command is only available to the super admin."
+	MsgAdminSearchUsage    = "Usage: " + CmdAdminSearch + " <name>\n\nSearch all groups by name."
+	MsgAdminSearchNoResult = "No groups found matching \"%s\"."
+	MsgAdminSearchResult   = "Groups matching \"%s\":\n\n%s"
+	MsgAdminSetPlanUsage   = "Usage: " + CmdAdminSetPlan + " <chat_id> <plan>\n\nValid plans: free, pro, max, custom\n\nExample: " + CmdAdminSetPlan + " -1001234567890 pro"
+	MsgAdminSetPlanDone    = "Plan for %s (ID: %d) set to %s.\n\nSubscription created: expires %s."
+	MsgAdminSetPlanError   = "Error setting plan: %v"
+	MsgAdminGroupNotFound  = "Group not found. Use " + CmdAdminSearch + " to find groups."
+	MsgAdminSelectUsage    = "Usage: " + CmdAdminSelect + " <chat_id>\n\nSelect any group to configure (super admin only)."
+	MsgAdminSelectDone     = "Selected group: %s (ID: %d)\n\nYou can now configure this group using any setup command."
+
+	MsgAdminHelp = "Super Admin Commands\n\n" +
+		CmdAdminSearch + " <name> - Search all groups by name\n" +
+		CmdAdminSelect + " <chat_id> - Select any group to configure\n" +
+		CmdAdminSetPlan + " <chat_id> <plan> - Set a group's plan (free/pro/max/custom)\n" +
+		CmdAdminHelp + " - Show this message\n\n" +
+		"These commands bypass normal admin checks and payment requirements."
 )

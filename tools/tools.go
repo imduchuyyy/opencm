@@ -11,6 +11,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/imduchuyyy/opencm/database"
 	"github.com/imduchuyyy/opencm/llm"
+	"github.com/imduchuyyy/opencm/plan"
 )
 
 // Executor handles executing tool calls from the AI agent
@@ -19,39 +20,18 @@ type Executor struct {
 	db               *database.DB
 	chatID           int64 // The group chat being processed
 	langSearchAPIKey string
+	limits           plan.Limits
 }
 
-func NewExecutor(bot *tgbotapi.BotAPI, db *database.DB, chatID int64, langSearchAPIKey string) *Executor {
-	return &Executor{bot: bot, db: db, chatID: chatID, langSearchAPIKey: langSearchAPIKey}
+func NewExecutor(bot *tgbotapi.BotAPI, db *database.DB, chatID int64, langSearchAPIKey string, limits plan.Limits) *Executor {
+	return &Executor{bot: bot, db: db, chatID: chatID, langSearchAPIKey: langSearchAPIKey, limits: limits}
 }
 
-// GetAvailableTools returns tool definitions for the agent
-func GetAvailableTools() []llm.ToolDef {
+// GetAvailableTools returns all tool definitions for the agent.
+// All tools are always included so the LLM knows they exist.
+// Plan-based access control is enforced at execution time in the Executor.
+func GetAvailableTools(limits plan.Limits) []llm.ToolDef {
 	var tools []llm.ToolDef
-
-	// send_message - always available
-	tools = append(tools, llm.ToolDef{
-		Name:        "send_message",
-		Description: "Send a text message to a chat. Use this to reply to users, answer questions, or participate in conversations.",
-		Parameters: map[string]interface{}{
-			"type": "object",
-			"properties": map[string]interface{}{
-				"chat_id": map[string]interface{}{
-					"type":        "integer",
-					"description": "The chat ID to send the message to",
-				},
-				"text": map[string]interface{}{
-					"type":        "string",
-					"description": "The message text to send. Supports Markdown formatting.",
-				},
-				"reply_to_message_id": map[string]interface{}{
-					"type":        "integer",
-					"description": "Optional. Message ID to reply to.",
-				},
-			},
-			"required": []string{"chat_id", "text"},
-		},
-	})
 
 	// send_poll - always available
 	tools = append(tools, llm.ToolDef{
@@ -86,10 +66,11 @@ func GetAvailableTools() []llm.ToolDef {
 		},
 	})
 
-	// Web tools - always available
+	// Web tools - always included so the LLM knows they exist.
+	// Plan enforcement happens in the Executor at execution time.
 	tools = append(tools, llm.ToolDef{
 		Name:        "web_search",
-		Description: "Search the web for real-time information. Use this for current events, recent data, or any information beyond your knowledge cutoff. The current year is " + fmt.Sprintf("%d", time.Now().Year()) + ".",
+		Description: "Search the web for real-time information. Use this for current events, recent data, or any information beyond your knowledge cutoff. The current year is " + fmt.Sprintf("%d", time.Now().Year()) + ". Note: This tool requires a Pro plan or higher. If the group is on the Free plan, the tool will return an error explaining the upgrade path.",
 		Parameters: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -108,7 +89,7 @@ func GetAvailableTools() []llm.ToolDef {
 
 	tools = append(tools, llm.ToolDef{
 		Name:        "web_fetch",
-		Description: "Fetch and read the content of a URL/website. Returns the page content as plain text. Use this to read links shared in chat or referenced in search results.",
+		Description: "Fetch and read the content of a URL/website. Returns the page content as plain text. Use this to read links shared in chat or referenced in search results. Note: This tool requires a Pro plan or higher. If the group is on the Free plan, the tool will return an error explaining the upgrade path.",
 		Parameters: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -160,8 +141,6 @@ func GetAvailableTools() []llm.ToolDef {
 // Execute runs a tool call and returns the result as a string
 func (e *Executor) Execute(tc llm.ToolCall) (string, error) {
 	switch tc.Name {
-	case "send_message":
-		return e.sendMessage(tc.Arguments)
 	case "send_poll":
 		return e.sendPoll(tc.Arguments)
 	case "web_search":
@@ -177,68 +156,39 @@ func (e *Executor) Execute(tc llm.ToolCall) (string, error) {
 	}
 }
 
-func (e *Executor) sendMessage(args map[string]interface{}) (string, error) {
-	chatID := int64(args["chat_id"].(float64))
-	text := args["text"].(string)
-
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "Markdown"
-
-	if replyTo, ok := args["reply_to_message_id"]; ok {
-		msg.ReplyToMessageID = int(replyTo.(float64))
-	}
-
-	sent, err := e.bot.Send(msg)
-	if err != nil {
-		msg.ParseMode = ""
-		sent, err = e.bot.Send(msg)
-		if err != nil {
-			return "", fmt.Errorf("send message: %w", err)
-		}
-	}
-
-	// Save the bot's own message to DB for context history
-	if e.db != nil {
-		botUser := e.bot.Self
-		replyToID := 0
-		if replyTo, ok := args["reply_to_message_id"]; ok {
-			replyToID = int(replyTo.(float64))
-		}
-		dbMsg := &database.Message{
-			ChatID:           chatID,
-			ChatType:         "group",
-			MessageID:        sent.MessageID,
-			ReplyToMessageID: replyToID,
-			FromUserID:       botUser.ID,
-			FromUsername:     botUser.UserName,
-			FromFirstName:    botUser.FirstName,
-			Text:             text,
-			IsProcessed:      true,
-		}
-		e.db.SaveMessage(dbMsg)
-	}
-
-	return fmt.Sprintf("Message sent (ID: %d)", sent.MessageID), nil
-}
-
 func (e *Executor) sendPoll(args map[string]interface{}) (string, error) {
-	chatID := int64(args["chat_id"].(float64))
-	question := args["question"].(string)
+	chatIDFloat, ok := args["chat_id"].(float64)
+	if !ok {
+		return "", fmt.Errorf("chat_id is required and must be a number")
+	}
+	chatID := int64(chatIDFloat)
 
-	optionsRaw := args["options"].([]interface{})
+	question, ok := args["question"].(string)
+	if !ok || question == "" {
+		return "", fmt.Errorf("question is required and must be a string")
+	}
+
+	optionsRaw, ok := args["options"].([]interface{})
+	if !ok || len(optionsRaw) < 2 {
+		return "", fmt.Errorf("options is required and must be an array with at least 2 items")
+	}
 	var options []string
 	for _, o := range optionsRaw {
-		options = append(options, o.(string))
+		if s, ok := o.(string); ok {
+			options = append(options, s)
+		}
+	}
+	if len(options) < 2 {
+		return "", fmt.Errorf("at least 2 valid string options are required")
 	}
 
 	poll := tgbotapi.NewPoll(chatID, question, options...)
 
-	if anon, ok := args["is_anonymous"]; ok {
-		isAnon := anon.(bool)
-		poll.IsAnonymous = isAnon
+	if anon, ok := args["is_anonymous"].(bool); ok {
+		poll.IsAnonymous = anon
 	}
-	if multi, ok := args["allows_multiple_answers"]; ok {
-		poll.AllowsMultipleAnswers = multi.(bool)
+	if multi, ok := args["allows_multiple_answers"].(bool); ok {
+		poll.AllowsMultipleAnswers = multi
 	}
 
 	sent, err := e.bot.Send(poll)
@@ -249,6 +199,10 @@ func (e *Executor) sendPoll(args map[string]interface{}) (string, error) {
 }
 
 func (e *Executor) webSearch(args map[string]interface{}) (string, error) {
+	if !e.limits.WebSearch {
+		return "ERROR: Web search is not available on this group's current plan (Free). The group admin needs to upgrade to the Pro plan or higher to enable web search. Do NOT retry this tool - instead, answer the user's question using your own knowledge and let them know that web search requires a plan upgrade.", nil
+	}
+
 	query, _ := args["query"].(string)
 	if query == "" {
 		return "", fmt.Errorf("query is required")
@@ -347,6 +301,10 @@ func (e *Executor) webSearch(args map[string]interface{}) (string, error) {
 }
 
 func (e *Executor) webFetch(args map[string]interface{}) (string, error) {
+	if !e.limits.WebFetch {
+		return "ERROR: Web fetch is not available on this group's current plan (Free). The group admin needs to upgrade to the Pro plan or higher to enable reading web pages. Do NOT retry this tool - instead, let the user know that fetching URLs requires a plan upgrade.", nil
+	}
+
 	url, _ := args["url"].(string)
 	if url == "" {
 		return "", fmt.Errorf("url is required")
@@ -416,8 +374,8 @@ func (e *Executor) setConfig(args map[string]interface{}) (string, error) {
 	field, _ := args["field"].(string)
 	value, _ := args["value"].(string)
 	requestedBy := int64(0)
-	if uid, ok := args["requested_by_user_id"]; ok {
-		requestedBy = int64(uid.(float64))
+	if uid, ok := args["requested_by_user_id"].(float64); ok {
+		requestedBy = int64(uid)
 	}
 
 	// Check admin permission via Telegram API
@@ -462,11 +420,12 @@ func (e *Executor) setConfig(args map[string]interface{}) (string, error) {
 // ----- Helpers -----
 
 func truncateStr(s string, max int) string {
-	if len(s) > max {
-		return s[:max] + "..."
-	}
 	if s == "" {
 		return "(not set)"
+	}
+	runes := []rune(s)
+	if len(runes) > max {
+		return string(runes[:max]) + "..."
 	}
 	return s
 }

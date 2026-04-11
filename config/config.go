@@ -8,11 +8,12 @@ import (
 )
 
 type Config struct {
-	BotToken         string
-	DatabasePath     string
-	DefaultModel     string
-	OpenAIAPIKey     string
-	LangSearchAPIKey string
+	BotToken           string
+	DatabasePath       string
+	DefaultModel       string
+	OpenAIAPIKey       string
+	LangSearchAPIKey   string
+	SuperAdminUsername string // Telegram username (without @) that has super admin privileges
 }
 
 func Load() *Config {
@@ -20,11 +21,12 @@ func Load() *Config {
 		log.Println("No .env file found, reading from environment variables")
 	}
 	return &Config{
-		BotToken:         getEnv("BOT_TOKEN", ""),
-		DatabasePath:     getEnv("DATABASE_PATH", "opencm.db"),
-		DefaultModel:     getEnv("DEFAULT_MODEL", "gpt-4o"),
-		OpenAIAPIKey:     getEnv("OPENAI_API_KEY", ""),
-		LangSearchAPIKey: getEnv("LANGSEARCH_API_KEY", ""),
+		BotToken:           getEnv("BOT_TOKEN", ""),
+		DatabasePath:       getEnv("DATABASE_PATH", "opencm.db"),
+		DefaultModel:       getEnv("DEFAULT_MODEL", "gpt-4o"),
+		OpenAIAPIKey:       getEnv("OPENAI_API_KEY", ""),
+		LangSearchAPIKey:   getEnv("LANGSEARCH_API_KEY", ""),
+		SuperAdminUsername: getEnv("SUPER_ADMIN_USERNAME", ""),
 	}
 }
 

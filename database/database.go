@@ -39,7 +39,7 @@ func (db *DB) migrate() error {
 			bio TEXT NOT NULL DEFAULT '',
 			topics TEXT NOT NULL DEFAULT '',
 			message_examples TEXT NOT NULL DEFAULT '',
-			chat_style TEXT NOT NULL DEFAULT 'friendly and helpful',
+			chat_style TEXT NOT NULL DEFAULT 'friendly, short and helpful',
 			vector_store_id TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -111,6 +111,9 @@ func (db *DB) migrate() error {
 		db.conn.Exec(m) // ignore error (column may already exist)
 	}
 
+	// Additive index migrations (ignore error if already exists)
+	db.conn.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_chat_msg ON messages(chat_id, message_id)`)
+
 	// Additional tables that may be added after initial migration
 	additionalTables := []string{
 		`CREATE TABLE IF NOT EXISTS usage_logs (
@@ -119,6 +122,18 @@ func (db *DB) migrate() error {
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_chat_month ON usage_logs(chat_id, created_at)`,
+		`CREATE TABLE IF NOT EXISTS subscriptions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			chat_id INTEGER NOT NULL,
+			plan TEXT NOT NULL,
+			billing_period TEXT NOT NULL DEFAULT 'monthly',
+			star_amount INTEGER NOT NULL DEFAULT 0,
+			telegram_payment_charge_id TEXT NOT NULL DEFAULT '',
+			started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			expires_at DATETIME NOT NULL,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_subscriptions_chat ON subscriptions(chat_id, expires_at)`,
 	}
 	for _, m := range additionalTables {
 		if _, err := db.conn.Exec(m); err != nil {
@@ -188,7 +203,7 @@ func (db *DB) UpdateGroupConfigField(chatID int64, field, value string) error {
 
 func (db *DB) SaveMessage(msg *Message) error {
 	res, err := db.conn.Exec(
-		`INSERT INTO messages (chat_id, chat_type, message_id, reply_to_message_id, from_user_id, from_username, from_first_name, text, media_type, media_file_id, is_processed)
+		`INSERT OR IGNORE INTO messages (chat_id, chat_type, message_id, reply_to_message_id, from_user_id, from_username, from_first_name, text, media_type, media_file_id, is_processed)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		msg.ChatID, msg.ChatType, msg.MessageID, msg.ReplyToMessageID, msg.FromUserID, msg.FromUsername, msg.FromFirstName, msg.Text, msg.MediaType, msg.MediaFileID, msg.IsProcessed,
 	)
@@ -462,6 +477,30 @@ func (db *DB) GetGroup(chatID int64) (*Group, error) {
 	return g, nil
 }
 
+// SearchGroupsByName searches active groups by title (case-insensitive LIKE match)
+func (db *DB) SearchGroupsByName(query string) ([]*Group, error) {
+	rows, err := db.conn.Query(
+		`SELECT id, chat_id, chat_title, chat_type, is_active, joined_at
+		 FROM groups_ WHERE is_active = 1 AND chat_title LIKE ?
+		 ORDER BY chat_title ASC LIMIT 20`,
+		"%"+query+"%",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []*Group
+	for rows.Next() {
+		g := &Group{}
+		if err := rows.Scan(&g.ID, &g.ChatID, &g.ChatTitle, &g.ChatType, &g.IsActive, &g.JoinedAt); err != nil {
+			return nil, err
+		}
+		groups = append(groups, g)
+	}
+	return groups, nil
+}
+
 // ----- Usage Tracking -----
 
 // LogUsage records one AI response for a group
@@ -492,4 +531,69 @@ func (db *DB) GetMinuteUsage(chatID int64) (int, error) {
 		chatID,
 	).Scan(&count)
 	return count, err
+}
+
+// ----- Subscriptions -----
+
+// CreateSubscription inserts a new subscription record
+func (db *DB) CreateSubscription(sub *Subscription) error {
+	res, err := db.conn.Exec(
+		`INSERT INTO subscriptions (chat_id, plan, billing_period, star_amount, telegram_payment_charge_id, started_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		sub.ChatID, sub.Plan, sub.BillingPeriod, sub.StarAmount, sub.TelegramPaymentChargeID,
+		sub.StartedAt, sub.ExpiresAt,
+	)
+	if err != nil {
+		return err
+	}
+	id, _ := res.LastInsertId()
+	sub.ID = id
+	sub.CreatedAt = sub.StartedAt
+	return nil
+}
+
+// GetActiveSubscription returns the most recent active (non-expired) subscription for a group.
+// Returns nil, nil if no active subscription exists.
+func (db *DB) GetActiveSubscription(chatID int64) (*Subscription, error) {
+	sub := &Subscription{}
+	err := db.conn.QueryRow(
+		`SELECT id, chat_id, plan, billing_period, star_amount, telegram_payment_charge_id, started_at, expires_at, created_at
+		 FROM subscriptions
+		 WHERE chat_id = ? AND expires_at > datetime('now')
+		 ORDER BY expires_at DESC LIMIT 1`,
+		chatID,
+	).Scan(&sub.ID, &sub.ChatID, &sub.Plan, &sub.BillingPeriod, &sub.StarAmount,
+		&sub.TelegramPaymentChargeID, &sub.StartedAt, &sub.ExpiresAt, &sub.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return sub, nil
+}
+
+// GetEffectivePlan returns the current plan for a group based on active subscription.
+// Falls back to "free" if no active subscription.
+func (db *DB) GetEffectivePlan(chatID int64) plan.Plan {
+	sub, err := db.GetActiveSubscription(chatID)
+	if err != nil || sub == nil {
+		return plan.Free
+	}
+	p := plan.Plan(sub.Plan)
+	if !p.Valid() {
+		return plan.Free
+	}
+	return p
+}
+
+// ExpireActiveSubscriptions immediately expires all active subscriptions for a group
+// by setting their expires_at to now. Used when a super admin downgrades a group.
+func (db *DB) ExpireActiveSubscriptions(chatID int64) error {
+	_, err := db.conn.Exec(
+		`UPDATE subscriptions SET expires_at = datetime('now')
+		 WHERE chat_id = ? AND expires_at > datetime('now')`,
+		chatID,
+	)
+	return err
 }

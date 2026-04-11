@@ -4,10 +4,45 @@ package plan
 type Plan string
 
 const (
-	Free Plan = "free"
-	Pro  Plan = "pro"
-	Max  Plan = "max"
+	Free   Plan = "free"
+	Pro    Plan = "pro"
+	Max    Plan = "max"
+	Custom Plan = "custom"
 )
+
+// BillingPeriod represents the billing cycle
+type BillingPeriod string
+
+const (
+	Monthly BillingPeriod = "monthly"
+	Yearly  BillingPeriod = "yearly"
+)
+
+// Star pricing constants (1 Star ≈ $0.013)
+const (
+	ProMonthlyStars = 1500  // ~$19/mo
+	ProYearlyStars  = 15000 // ~$190/yr ($15.83/mo)
+	MaxMonthlyStars = 3750  // ~$49/mo
+	MaxYearlyStars  = 37500 // ~$490/yr ($40.83/mo)
+)
+
+// StarPrice returns the star amount for a plan and billing period. Returns 0 for Free/Custom.
+func StarPrice(p Plan, period BillingPeriod) int {
+	switch p {
+	case Pro:
+		if period == Yearly {
+			return ProYearlyStars
+		}
+		return ProMonthlyStars
+	case Max:
+		if period == Yearly {
+			return MaxYearlyStars
+		}
+		return MaxMonthlyStars
+	default:
+		return 0
+	}
+}
 
 // Limits holds the enforced limits for a plan
 type Limits struct {
@@ -15,6 +50,8 @@ type Limits struct {
 	PerMinute       int   // Max AI responses per rolling 60s window
 	KnowledgeUpload bool  // Whether knowledge upload is allowed
 	MaxFileSize     int64 // Max file size for knowledge uploads in bytes (0 = not allowed)
+	WebSearch       bool  // Whether web_search tool is available
+	WebFetch        bool  // Whether web_fetch tool is available
 }
 
 // planLimits maps each plan to its limits
@@ -24,18 +61,32 @@ var planLimits = map[Plan]Limits{
 		PerMinute:       10,
 		KnowledgeUpload: false,
 		MaxFileSize:     0,
+		WebSearch:       false,
+		WebFetch:        false,
 	},
 	Pro: {
-		MonthlyMessages: 10_000,
-		PerMinute:       100,
-		KnowledgeUpload: true,
-		MaxFileSize:     5 * 1024 * 1024, // 5 MB
+		MonthlyMessages: 2500,
+		PerMinute:       30,
+		KnowledgeUpload: false,
+		MaxFileSize:     0,
+		WebSearch:       true,
+		WebFetch:        true,
 	},
 	Max: {
-		MonthlyMessages: 50_000,
-		PerMinute:       100,
+		MonthlyMessages: 10_000,
+		PerMinute:       60,
 		KnowledgeUpload: true,
-		MaxFileSize:     20 * 1024 * 1024, // 20 MB
+		MaxFileSize:     10 * 1024 * 1024, // 10 MB
+		WebSearch:       true,
+		WebFetch:        true,
+	},
+	Custom: {
+		MonthlyMessages: 100_000,
+		PerMinute:       120,
+		KnowledgeUpload: true,
+		MaxFileSize:     50 * 1024 * 1024, // 50 MB
+		WebSearch:       true,
+		WebFetch:        true,
 	},
 }
 
@@ -53,13 +104,34 @@ func (p Plan) Valid() bool {
 	return ok
 }
 
-// DisplayName returns a human-readable plan name
+// IsPaid returns true if the plan requires payment
+func (p Plan) IsPaid() bool {
+	return p == Pro || p == Max
+}
+
+// DisplayName returns a human-readable plan name with pricing
 func (p Plan) DisplayName() string {
 	switch p {
 	case Pro:
-		return "Pro ($49/mo)"
+		return "Pro ($19/mo)"
 	case Max:
-		return "Max ($99/mo)"
+		return "Max ($49/mo)"
+	case Custom:
+		return "Custom"
+	default:
+		return "Free"
+	}
+}
+
+// ShortName returns just the plan name without price
+func (p Plan) ShortName() string {
+	switch p {
+	case Pro:
+		return "Pro"
+	case Max:
+		return "Max"
+	case Custom:
+		return "Custom"
 	default:
 		return "Free"
 	}

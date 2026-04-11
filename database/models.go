@@ -68,3 +68,16 @@ type Knowledge struct {
 	AddedBy      int64     `json:"added_by"`
 	CreatedAt    time.Time `json:"created_at"`
 }
+
+// Subscription tracks a paid plan subscription for a group
+type Subscription struct {
+	ID                      int64     `json:"id"`
+	ChatID                  int64     `json:"chat_id"`                    // Group this subscription is for
+	Plan                    string    `json:"plan"`                       // pro, max, custom
+	BillingPeriod           string    `json:"billing_period"`             // monthly, yearly
+	StarAmount              int       `json:"star_amount"`                // Number of Telegram Stars paid
+	TelegramPaymentChargeID string    `json:"telegram_payment_charge_id"` // For refunds
+	StartedAt               time.Time `json:"started_at"`
+	ExpiresAt               time.Time `json:"expires_at"`
+	CreatedAt               time.Time `json:"created_at"`
+}

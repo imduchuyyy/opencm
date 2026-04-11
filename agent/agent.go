@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -20,7 +21,9 @@ type Agent struct {
 	bot       *tgbotapi.BotAPI
 	db        *database.DB
 	appConfig *config.Config
+	llmClient *llm.Client
 	cancel    context.CancelFunc
+	processMu sync.Mutex // guards processBatch to prevent double-processing
 }
 
 // New creates the agent bot
@@ -35,6 +38,7 @@ func New(cfg *config.Config, db *database.DB) (*Agent, error) {
 		bot:       bot,
 		db:        db,
 		appConfig: cfg,
+		llmClient: llm.NewClient(cfg.OpenAIAPIKey, cfg.DefaultModel),
 	}, nil
 }
 
@@ -94,6 +98,42 @@ func (a *Agent) deleteThinking(chatID int64, messageID int) {
 	}
 }
 
+// sendReply sends the agent's text response as a reply to a specific message.
+// Tries Markdown first, falls back to plain text. Saves the bot's message to DB.
+func (a *Agent) sendReply(chatID int64, replyToMsgID int, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyToMessageID = replyToMsgID
+	msg.ParseMode = "Markdown"
+
+	sent, err := a.bot.Send(msg)
+	if err != nil {
+		// Markdown failed, retry without parse mode
+		msg.ParseMode = ""
+		sent, err = a.bot.Send(msg)
+		if err != nil {
+			log.Printf("[Agent] Failed to send reply to chat %d: %v", chatID, err)
+			return
+		}
+	}
+
+	// Save bot's own message to DB for context history
+	botUser := a.bot.Self
+	dbMsg := &database.Message{
+		ChatID:           chatID,
+		ChatType:         "group",
+		MessageID:        sent.MessageID,
+		ReplyToMessageID: replyToMsgID,
+		FromUserID:       botUser.ID,
+		FromUsername:     botUser.UserName,
+		FromFirstName:    botUser.FirstName,
+		Text:             text,
+		IsProcessed:      true,
+	}
+	if err := a.db.SaveMessage(dbMsg); err != nil {
+		log.Printf("[Agent] Failed to save bot reply to DB: %v", err)
+	}
+}
+
 // isVisionMedia returns true if the media type can be understood by OpenAI vision
 func isVisionMedia(mediaType string) bool {
 	return mediaType == "photo" || mediaType == "animation"
@@ -139,6 +179,24 @@ func (a *Agent) isAdmin(chatID, userID int64) bool {
 	return false
 }
 
+// isSuperAdmin checks if a username matches the configured super admin
+func (a *Agent) isSuperAdmin(username string) bool {
+	sa := a.appConfig.SuperAdminUsername
+	if sa == "" || username == "" {
+		return false
+	}
+	return strings.EqualFold(username, sa)
+}
+
+// isAdminOrSuperAdmin checks if a user is a group admin or the super admin.
+// Used for config/knowledge operations where super admin should bypass group admin checks.
+func (a *Agent) isAdminOrSuperAdmin(chatID, userID int64, username string) bool {
+	if a.isSuperAdmin(username) {
+		return true
+	}
+	return a.isAdmin(chatID, userID)
+}
+
 // getAdminGroups returns a list of active groups where the given user is an admin.
 // Only checks groups where the user has been seen (tracked via group_members table),
 // avoiding O(N) Telegram API calls across all groups.
@@ -177,6 +235,12 @@ func (a *Agent) pollMessages(ctx context.Context) {
 
 // handleUpdate processes a single Telegram update
 func (a *Agent) handleUpdate(update tgbotapi.Update) {
+	// Handle pre-checkout queries for Telegram Stars payments (must respond within 10s)
+	if update.PreCheckoutQuery != nil {
+		a.handlePreCheckoutQuery(update.PreCheckoutQuery)
+		return
+	}
+
 	// Handle being added/removed from groups
 	if update.MyChatMember != nil {
 		a.handleMyChatMember(update.MyChatMember)
@@ -188,6 +252,12 @@ func (a *Agent) handleUpdate(update tgbotapi.Update) {
 	}
 
 	msg := update.Message
+
+	// Handle successful payment messages (Telegram Stars)
+	if msg.SuccessfulPayment != nil {
+		a.handleSuccessfulPayment(msg)
+		return
+	}
 
 	// Log received message
 	logText := msg.Text
@@ -324,6 +394,13 @@ func (a *Agent) processLoop(ctx context.Context) {
 
 // processBatch gets all unprocessed messages and sends them to the AI
 func (a *Agent) processBatch(ctx context.Context) {
+	// Prevent overlapping batch runs. If the previous batch is still processing,
+	// skip this tick rather than risk double-processing the same messages.
+	if !a.processMu.TryLock() {
+		return
+	}
+	defer a.processMu.Unlock()
+
 	msgs, err := a.db.GetUnprocessedMessages()
 	if err != nil {
 		log.Printf("[Agent] Error getting unprocessed messages: %v", err)
@@ -339,10 +416,19 @@ func (a *Agent) processBatch(ctx context.Context) {
 		chatMessages[msg.ChatID] = append(chatMessages[msg.ChatID], msg)
 	}
 
-	// Process each chat's messages
+	// Process each chat's messages concurrently (max 5 concurrent chats)
+	sem := make(chan struct{}, 5)
+	var wg sync.WaitGroup
 	for chatID, chatMsgs := range chatMessages {
-		a.processChatMessages(ctx, chatID, chatMsgs)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(cid int64, cmsgs []*database.Message) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			a.processChatMessages(ctx, cid, cmsgs)
+		}(chatID, chatMsgs)
 	}
+	wg.Wait()
 }
 
 // isMentioned checks if any message in the batch mentions the bot
@@ -368,7 +454,7 @@ func (a *Agent) isMentioned(chatID int64, msgs []*database.Message) bool {
 			return true
 		}
 		for _, name := range nameWords {
-			if strings.Contains(text, name) {
+			if containsWholeWord(text, name) {
 				return true
 			}
 		}
@@ -380,6 +466,34 @@ func (a *Agent) isMentioned(chatID int64, msgs []*database.Message) bool {
 		}
 	}
 	return false
+}
+
+// containsWholeWord checks if text contains the word as a whole word (not as a substring of another word).
+// Uses simple boundary check: the character before and after the match must not be a letter or digit.
+func containsWholeWord(text, word string) bool {
+	start := 0
+	for {
+		idx := strings.Index(text[start:], word)
+		if idx == -1 {
+			return false
+		}
+		absIdx := start + idx
+		endIdx := absIdx + len(word)
+
+		// Check left boundary: beginning of string or non-alphanumeric character
+		leftOK := absIdx == 0 || !isAlphaNum(rune(text[absIdx-1]))
+		// Check right boundary: end of string or non-alphanumeric character
+		rightOK := endIdx == len(text) || !isAlphaNum(rune(text[endIdx]))
+
+		if leftOK && rightOK {
+			return true
+		}
+		start = absIdx + 1
+	}
+}
+
+func isAlphaNum(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
 }
 
 // fetchGroupContext fetches live group info from the Telegram API for the system prompt
@@ -458,13 +572,30 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 	// Load per-group config
 	groupCfg := a.getOrCreateGroupConfig(chatID)
 
+	// Derive effective plan from active subscription (overrides stored plan)
+	effectivePlan := a.db.GetEffectivePlan(chatID)
+	if effectivePlan != groupCfg.Plan {
+		groupCfg.Plan = effectivePlan
+		// Sync the derived plan back to the stored config
+		if err := a.db.UpsertGroupConfig(groupCfg); err != nil {
+			log.Printf("[Agent] Error syncing plan for chat %d: %v", chatID, err)
+		}
+	}
+
 	// Enforce plan limits before calling the LLM
 	limits := plan.GetLimits(groupCfg.Plan)
 
 	monthlyUsage, err := a.db.GetMonthlyUsage(chatID)
 	if err != nil {
-		log.Printf("[Agent] Error getting monthly usage for chat %d: %v", chatID, err)
-	} else if monthlyUsage >= limits.MonthlyMessages {
+		log.Printf("[Agent] Error getting monthly usage for chat %d, blocking as precaution: %v", chatID, err)
+		ids := make([]int64, len(msgs))
+		for i, m := range msgs {
+			ids[i] = m.ID
+		}
+		a.db.MarkMessagesProcessed(ids, "usage check error - skipped")
+		return
+	}
+	if monthlyUsage >= limits.MonthlyMessages {
 		log.Printf("[Agent] Chat %d hit monthly limit (%d/%d, plan: %s)", chatID, monthlyUsage, limits.MonthlyMessages, groupCfg.Plan)
 		ids := make([]int64, len(msgs))
 		for i, m := range msgs {
@@ -476,8 +607,15 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 
 	minuteUsage, err := a.db.GetMinuteUsage(chatID)
 	if err != nil {
-		log.Printf("[Agent] Error getting minute usage for chat %d: %v", chatID, err)
-	} else if minuteUsage >= limits.PerMinute {
+		log.Printf("[Agent] Error getting minute usage for chat %d, blocking as precaution: %v", chatID, err)
+		ids := make([]int64, len(msgs))
+		for i, m := range msgs {
+			ids[i] = m.ID
+		}
+		a.db.MarkMessagesProcessed(ids, "rate check error - skipped")
+		return
+	}
+	if minuteUsage >= limits.PerMinute {
 		log.Printf("[Agent] Chat %d hit rate limit (%d/%d per min, plan: %s)", chatID, minuteUsage, limits.PerMinute, groupCfg.Plan)
 		ids := make([]int64, len(msgs))
 		for i, m := range msgs {
@@ -489,6 +627,20 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 
 	// Get last 10 messages for context
 	recentMsgs, _ := a.db.GetRecentMessages(chatID, 10)
+
+	// Remove any messages from recent history that are also in the new batch
+	// to avoid sending duplicates to the LLM
+	newMsgIDs := make(map[int64]bool)
+	for _, m := range msgs {
+		newMsgIDs[m.ID] = true
+	}
+	var filteredRecent []*database.Message
+	for _, m := range recentMsgs {
+		if !newMsgIDs[m.ID] {
+			filteredRecent = append(filteredRecent, m)
+		}
+	}
+	recentMsgs = filteredRecent
 
 	// Collect recent message IDs
 	recentMsgIDs := make(map[int]bool)
@@ -521,15 +673,13 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 	groupCtx := a.fetchGroupContext(chatID)
 
 	// Use the global default model
-	model := a.appConfig.DefaultModel
-
 	apiKey := a.appConfig.OpenAIAPIKey
 	if apiKey == "" {
 		log.Printf("[Agent] No OpenAI API key configured")
 		return
 	}
 
-	client := llm.NewClient(apiKey, model)
+	client := a.llmClient
 
 	// Build system prompt and user messages
 	systemPrompt := buildSystemPrompt(groupCfg, groupCtx, a.bot.Self.UserName, a.bot.Self.FirstName)
@@ -539,22 +689,25 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 
 	userMessages := buildUserMessages(recentMsgs, msgs, replyContext, mediaURLs)
 
-	// Get available tools
-	availableTools := tools.GetAvailableTools()
+	// Get available tools based on plan
+	availableTools := tools.GetAvailableTools(limits)
+
+	// Determine which message to reply to (last message in the triggering batch)
+	replyToMsgID := msgs[len(msgs)-1].MessageID
 
 	// Send "Thinking..." indicator
 	thinkingMsgID := a.sendThinking(chatID)
+	defer a.deleteThinking(chatID, thinkingMsgID)
 
 	// Call the AI
 	response, err := client.Chat(ctx, systemPrompt, userMessages, availableTools, groupCfg.VectorStoreID)
 	if err != nil {
 		log.Printf("[Agent] LLM error for chat %d: %v", chatID, err)
-		a.deleteThinking(chatID, thinkingMsgID)
 		return
 	}
 
 	// Tool execution loop
-	executor := tools.NewExecutor(a.bot, a.db, chatID, a.appConfig.LangSearchAPIKey)
+	executor := tools.NewExecutor(a.bot, a.db, chatID, a.appConfig.LangSearchAPIKey, limits)
 	var allResults []string
 	maxIterations := 5
 
@@ -594,17 +747,16 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 		}
 	}
 
-	// Delete the "Thinking..." message
-	a.deleteThinking(chatID, thinkingMsgID)
+	// Send the LLM's final text output as the bot's reply
+	responseText := strings.TrimSpace(response.Text)
+	if responseText != "" {
+		a.sendReply(chatID, replyToMsgID, responseText)
+		allResults = append(allResults, "reply: "+responseText)
+	}
 
 	// Log usage for this AI response
 	if err := a.db.LogUsage(chatID); err != nil {
 		log.Printf("[Agent] Error logging usage for chat %d: %v", chatID, err)
-	}
-
-	responseText := strings.TrimSpace(response.Text)
-	if responseText != "" && !strings.EqualFold(responseText, "done") {
-		allResults = append(allResults, "text: "+responseText)
 	}
 
 	aiResponseSummary := "skipped"
@@ -624,12 +776,11 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 // toolStatusText returns a user-friendly status string for the current tool calls
 func toolStatusText(toolCalls []llm.ToolCall) string {
 	displayNames := map[string]string{
-		"web_search":   "Searching the web...",
-		"web_fetch":    "Reading a webpage...",
-		"send_message": "Sending message...",
-		"send_poll":    "Creating poll...",
-		"get_config":   "Reading configuration...",
-		"set_config":   "Updating configuration...",
+		"web_search": "Searching the web...",
+		"web_fetch":  "Reading a webpage...",
+		"send_poll":  "Creating poll...",
+		"get_config": "Reading configuration...",
+		"set_config": "Updating configuration...",
 	}
 
 	// If there's a single tool call, show its specific status
@@ -759,8 +910,6 @@ func buildSystemPrompt(cfg *database.GroupConfig, gc *GroupContext, botUsername,
 
 	parts = append(parts, "You are an AI community manager bot for a Telegram group.")
 
-	parts = append(parts, fmt.Sprintf("## Your Identity\nYour Telegram username: @%s\nYour name: %s", botUsername, botFirstName))
-
 	if gc != nil {
 		var groupParts []string
 		if gc.GroupName != "" {
@@ -800,19 +949,25 @@ func buildSystemPrompt(cfg *database.GroupConfig, gc *GroupContext, botUsername,
 		parts = append(parts, "## Example Messages (match this style)\n"+cfg.MessageExamples)
 	}
 
-	parts = append(parts, fmt.Sprintf(`## Behavior Guidelines
-- You respond when someone mentions you (by @%s or by name "%s") OR when someone replies to one of your messages.
+	parts = append(parts, `## Behavior Guidelines
 - When a user replies to your message, treat it as a continuation of the conversation and respond accordingly.
-- Messages with "ReplyTo:X" mean they are replying to message with MsgID X. Check the referenced messages section for older messages being replied to.
-- When mentioned or replied to, respond helpfully and in character.
-- Be natural and conversational, not robotic.
-- When replying, always include the correct chat_id and reply_to_message_id to reply to the message that mentioned you or the latest message in the thread.
 - You can call multiple tools in one response.
-- You have access to get_config and set_config tools. Only group admins can change your configuration. If a non-admin tries to change settings, politely decline.`, botUsername, botFirstName))
+- You have access to get_config and set_config tools. Only group admins can change your configuration. If a non-admin tries to change settings, politely decline.`)
+
+	parts = append(parts, `## Core Response Style
+- Keep it SHORT. No walls of text.
+- Talk like a sharp teammate, not a customer service bot. Be direct, skip filler.
+- If you don't know, say so in one line. Don't pad ignorance with fluff.
+- Match the group's energy. Casual group = casual tone. Technical group = precise answers.
+- NEVER ask the user a question back. Give your best answer. If info is missing, state what you'd need but still give what you can.
+- Drop the "Let me help you with that" template speak. Just help.
+`)
 
 	parts = append(parts, `## Tool Usage Rules
-- After you call tools (especially send_message), do NOT output any additional text. The tools already perform the actions. Just call the tools and output nothing, or output "DONE" to signal completion.
-- You must ALWAYS use the send_message tool to communicate with users. Any text you output directly will NOT be sent to the chat - it is only logged internally.`)
+- Your text output IS your reply. It will be sent directly to the chat as a message. Just write your response naturally.
+- You can also call tools (web_search, web_fetch, send_poll, get_config, set_config) when needed. After tools run, you'll get their results and can write your final response.
+- If you use tools, your final text output after all tool calls is what gets sent to the chat.
+- You can use Markdown formatting in your responses.`)
 
 	parts = append(parts, `## Knowledge Base (file_search)
 - You have access to a file_search tool that searches uploaded knowledge documents.
