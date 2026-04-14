@@ -49,6 +49,7 @@ func (a *Agent) Start(ctx context.Context) {
 
 	go a.pollMessages(ctx)
 	go a.processLoop(ctx)
+	go a.scheduledPostLoop(ctx)
 
 	log.Printf("[Agent] Running as @%s", a.bot.Self.UserName)
 
@@ -392,6 +393,63 @@ func (a *Agent) processLoop(ctx context.Context) {
 	}
 }
 
+// scheduledPostLoop runs every 60 seconds to check for due scheduled posts and execute them.
+func (a *Agent) scheduledPostLoop(ctx context.Context) {
+	// Initial delay to let the bot fully start up
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(30 * time.Second):
+	}
+
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.processScheduledPosts(ctx)
+		}
+	}
+}
+
+// processScheduledPosts finds all due scheduled posts and generates/sends them.
+func (a *Agent) processScheduledPosts(ctx context.Context) {
+	duePosts, err := a.db.GetDueScheduledPosts()
+	if err != nil {
+		log.Printf("[Posts] Error getting due scheduled posts: %v", err)
+		return
+	}
+	if len(duePosts) == 0 {
+		return
+	}
+
+	for _, sp := range duePosts {
+		// Verify the group's plan still allows scheduled posting
+		effectivePlan := a.db.GetEffectivePlan(sp.ChatID)
+		limits := plan.GetLimits(effectivePlan)
+		if !limits.SchedulePost {
+			log.Printf("[Posts] Group %d no longer on a plan that allows scheduled posts, deactivating", sp.ChatID)
+			a.db.DeactivateScheduledPost(sp.ChatID)
+			continue
+		}
+
+		log.Printf("[Posts] Generating scheduled post for group %d", sp.ChatID)
+
+		if err := a.generateScheduledPost(ctx, sp.ChatID); err != nil {
+			log.Printf("[Posts] Error generating scheduled post for group %d: %v", sp.ChatID, err)
+			// Still advance the schedule so we don't retry immediately
+		}
+
+		// Advance to next scheduled time
+		if err := a.db.AdvanceScheduledPost(sp.ChatID); err != nil {
+			log.Printf("[Posts] Error advancing schedule for group %d: %v", sp.ChatID, err)
+		}
+	}
+}
+
 // processBatch gets all unprocessed messages and sends them to the AI
 func (a *Agent) processBatch(ctx context.Context) {
 	// Prevent overlapping batch runs. If the previous batch is still processing,
@@ -638,6 +696,24 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 		}
 	}
 
+	// Fetch recent media messages (photos/animations) so the agent can "see" images
+	// shared in the last few messages even if they aren't in the current batch.
+	var recentMedia []*database.Message
+	allMediaMsgs, _ := a.db.GetRecentMediaMessages(chatID, 5)
+	// Deduplicate: exclude media messages already in the new batch or reply context
+	newMsgIDs := make(map[int]bool)
+	for _, m := range msgs {
+		newMsgIDs[m.MessageID] = true
+	}
+	for _, m := range replyContext {
+		newMsgIDs[m.MessageID] = true
+	}
+	for _, m := range allMediaMsgs {
+		if !newMsgIDs[m.MessageID] {
+			recentMedia = append(recentMedia, m)
+		}
+	}
+
 	// Fetch group context
 	groupCtx := a.fetchGroupContext(chatID)
 
@@ -654,9 +730,9 @@ func (a *Agent) processChatMessages(ctx context.Context, chatID int64, msgs []*d
 	systemPrompt := buildSystemPrompt(groupCfg, groupCtx, a.bot.Self.UserName, a.bot.Self.FirstName)
 
 	// Resolve image URLs from Telegram for vision-compatible media
-	mediaURLs := a.resolveMediaURLs(msgs, replyContext)
+	mediaURLs := a.resolveMediaURLs(msgs, replyContext, recentMedia)
 
-	userMessages := buildUserMessages(msgs, replyContext, mediaURLs)
+	userMessages := buildUserMessages(msgs, replyContext, recentMedia, mediaURLs)
 
 	// Get available tools based on plan
 	availableTools := tools.GetAvailableTools(limits)
@@ -850,12 +926,17 @@ func buildSectionMessages(msgs []*database.Message, mediaURLs map[int]string, he
 }
 
 // buildUserMessages constructs the user messages for the LLM.
-func buildUserMessages(newMsgs []*database.Message, replyContext []*database.Message, mediaURLs map[int]string) []llm.InputMessage {
+func buildUserMessages(newMsgs []*database.Message, replyContext []*database.Message, recentMedia []*database.Message, mediaURLs map[int]string) []llm.InputMessage {
 	var messages []llm.InputMessage
 
 	if len(replyContext) > 0 {
 		messages = append(messages,
 			buildSectionMessages(replyContext, mediaURLs, "=== REFERENCED MESSAGES (messages being replied to) ===", false)...)
+	}
+
+	if len(recentMedia) > 0 {
+		messages = append(messages,
+			buildSectionMessages(recentMedia, mediaURLs, "=== RECENT IMAGES (recently shared photos/animations) ===", false)...)
 	}
 
 	newSectionMsgs := buildSectionMessages(newMsgs, mediaURLs, "=== NEW MESSAGES (you were mentioned or replied to) ===", true)
@@ -934,21 +1015,10 @@ func buildSystemPrompt(cfg *database.GroupConfig, gc *GroupContext, botUsername,
 - If you use tools, your final text output after all tool calls is what gets sent to the chat.
 - You can use Markdown formatting in your responses.`)
 
-	parts = append(parts, `## Chat History Search
-- You have a search_chat_history tool that searches recent chat messages using a sub-agent.
-- Use it when someone asks about something that was discussed earlier, references a past conversation, or when you need context you don't have.
-- Do NOT use it for every message. Only use it when you genuinely need historical context.
-- The tool searches the last ~50 messages with text content.`)
-
 	parts = append(parts, `## Knowledge Base (file_search)
 - You have access to a file_search tool that searches uploaded knowledge documents.
 - ONLY use file_search when someone asks a specific question that likely requires information from the knowledge base.
 - Do NOT use file_search for casual messages, greetings, general chat, or questions you can answer from context alone.`)
-
-	parts = append(parts, `## Image Understanding
-- You can see images and photos shared in the chat. When images are attached to messages, they are included as image content alongside the text.
-- You can describe, analyze, and discuss images that users share.
-- If a user sends or references an image and asks about it, use your vision capabilities to understand and respond about the image content.`)
 
 	return strings.Join(parts, "\n\n")
 }

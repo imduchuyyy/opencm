@@ -21,6 +21,13 @@ const (
 	CmdHelp            = "/help"
 	CmdCancel          = "/cancel"
 
+	// Proactive posting commands
+	CmdCreatePost   = "/create_post"
+	CmdSetChannel   = "/set_channel"
+	CmdSetSchedule  = "/set_schedule"
+	CmdStopSchedule = "/stop_schedule"
+	CmdPostStatus   = "/post_status"
+
 	// Super admin commands
 	CmdAdminSearch  = "/admin_search"
 	CmdAdminSetPlan = "/admin_set_plan"
@@ -124,6 +131,12 @@ const (
 		CmdAddKnowledge + " - Upload a file (PDF, .md, .txt)\n" +
 		CmdAddURL + " - Add knowledge from a URL\n" +
 		CmdListKnowledge + " - View all knowledge entries\n\n" +
+		"Proactive Posting:\n" +
+		CmdCreatePost + " <link/keyword> - Research and post content (Pro+)\n" +
+		CmdSetChannel + " <channel_id> - Set post destination channel\n" +
+		CmdSetSchedule + " <hours> - Auto-post on schedule (Max+)\n" +
+		CmdStopSchedule + " - Stop auto-posting\n" +
+		CmdPostStatus + " - View posting status\n\n" +
 		"Subscription:\n" +
 		CmdPlan + " - View plan and usage\n" +
 		CmdSubscribePro + " - Upgrade to Pro ($19/mo)\n" +
@@ -147,6 +160,12 @@ const (
 		CmdAddURL + " - Add knowledge from URL\n" +
 		CmdListKnowledge + " - List all knowledge\n" +
 		CmdDeleteKnowledge + " <id> - Delete a knowledge entry\n\n" +
+		"Proactive Posting:\n" +
+		CmdCreatePost + " <link/keyword> - Research and post (Pro+)\n" +
+		CmdSetChannel + " <channel_id> - Set post channel\n" +
+		CmdSetSchedule + " <hours> - Auto-post schedule (Max+)\n" +
+		CmdStopSchedule + " - Stop auto-posting\n" +
+		CmdPostStatus + " - View posting status\n\n" +
 		"Subscription:\n" +
 		CmdPlan + " - View plan and usage\n" +
 		CmdSubscribePro + " - Upgrade to Pro\n" +
@@ -169,11 +188,13 @@ const (
 		"Rate Limit: %d messages/min\n" +
 		"Web Search: %s\n" +
 		"Web Fetch: %s\n" +
-		"Knowledge Upload: %s\n\n" +
+		"Knowledge Upload: %s\n" +
+		"Create Post: %s\n" +
+		"Scheduled Posts: %s\n\n" +
 		"Available Plans:\n" +
 		"  Free - 1,000 msgs/mo, bot config only\n" +
-		"  Pro ($19/mo or $190/yr) - 2,500 msgs/mo, web search, web fetch\n" +
-		"  Max ($49/mo or $490/yr) - 10,000 msgs/mo, all Pro features + knowledge (10MB)\n" +
+		"  Pro ($19/mo or $190/yr) - 2,500 msgs/mo, web search, web fetch, create posts\n" +
+		"  Max ($49/mo or $490/yr) - 10,000 msgs/mo, all Pro + knowledge (10MB) + scheduled posts\n" +
 		"  Custom - Contact admin for pricing\n\n" +
 		"Upgrade:\n" +
 		"  " + CmdSubscribePro + " - Upgrade to Pro (~1,500 Stars/mo)\n" +
@@ -191,6 +212,31 @@ const (
 	MsgAdminGroupNotFound  = "Group not found. Use " + CmdAdminSearch + " to find groups."
 	MsgAdminSelectUsage    = "Usage: " + CmdAdminSelect + " <chat_id>\n\nSelect any group to configure (super admin only)."
 	MsgAdminSelectDone     = "Selected group: %s (ID: %d)\n\nYou can now configure this group using any setup command."
+
+	// Proactive posting messages
+	MsgCreatePostUsage      = "Usage: " + CmdCreatePost + " <link or keyword>\n\nExamples:\n  " + CmdCreatePost + " https://x.com/user/status/123\n  " + CmdCreatePost + " Bitcoin ETF latest news\n  " + CmdCreatePost + " Ethereum merge anniversary"
+	MsgCreatePostNoPlan     = "Post creation requires the Pro plan or higher.\n\nUpgrade with " + CmdSubscribePro + " to unlock this feature."
+	MsgCreatePostGenerating = "Researching and writing post..."
+	MsgCreatePostDone       = "Post published!\n\nContent preview:\n%s"
+	MsgCreatePostError      = "Error creating post: %v\n\nPlease try again."
+	MsgSetChannelUsage      = "Usage: " + CmdSetChannel + " <channel_id>\n\nSet a channel where generated posts will be published. The bot must be an admin of the channel.\n\nTo find the channel ID, forward a message from the channel to @userinfobot or similar.\n\nUse " + CmdSetChannel + " reset to post to the group chat instead."
+	MsgSetChannelDone       = "Post channel set to: %s (ID: %d)\n\nGenerated posts will now be published there."
+	MsgSetChannelReset      = "Post channel removed. Posts will be sent to the group chat."
+	MsgSetChannelError      = "Error setting channel: %v"
+	MsgSetChannelNotAdmin   = "I'm not an admin of that channel. Please add me as an admin first, then try again."
+	MsgSetScheduleUsage     = "Usage: " + CmdSetSchedule + " <hours>\n\nSet how often the bot should automatically create and post content based on your configured topics.\n\nExamples:\n  " + CmdSetSchedule + " 24  (daily)\n  " + CmdSetSchedule + " 12  (twice a day)\n  " + CmdSetSchedule + " 168 (weekly)\n\nRequires topics to be configured (" + CmdSetTopics + ") and Max plan."
+	MsgSetScheduleNoPlan    = "Scheduled posting requires the Max plan.\n\nUpgrade with " + CmdSubscribeMax + " to unlock automatic posting."
+	MsgSetScheduleNoTopics  = "Please set topics first with " + CmdSetTopics + " so the bot knows what to post about."
+	MsgSetScheduleDone      = "Schedule activated!\n\nPosting every %d hours based on your configured topics.\nNext post: %s\n\nUse " + CmdStopSchedule + " to disable."
+	MsgStopScheduleDone     = "Scheduled posting disabled.\n\nUse " + CmdSetSchedule + " to re-enable."
+	MsgStopScheduleNone     = "No active schedule found for this group."
+	MsgPostStatusNone       = "No posting configuration for this group."
+	MsgPostStatusFmt        = "Posting Status for: %s\n\n" +
+		"Channel: %s\n" +
+		"Schedule: %s\n" +
+		"Last post: %s\n" +
+		"Next post: %s\n\n" +
+		"Recent posts: %d\n%s"
 
 	MsgAdminHelp = "Super Admin Commands\n\n" +
 		CmdAdminSearch + " <name> - Search all groups by name\n" +

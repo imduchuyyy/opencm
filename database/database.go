@@ -134,6 +134,36 @@ func (db *DB) migrate() error {
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_subscriptions_chat ON subscriptions(chat_id, expires_at)`,
+		`CREATE TABLE IF NOT EXISTS post_channels (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			chat_id INTEGER NOT NULL,
+			channel_id INTEGER NOT NULL,
+			title TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(chat_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS scheduled_posts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			chat_id INTEGER NOT NULL,
+			interval_hours INTEGER NOT NULL DEFAULT 24,
+			is_active BOOLEAN NOT NULL DEFAULT 1,
+			last_posted_at DATETIME NOT NULL DEFAULT '1970-01-01 00:00:00',
+			next_post_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(chat_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_scheduled_posts_next ON scheduled_posts(is_active, next_post_at)`,
+		`CREATE TABLE IF NOT EXISTS generated_posts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			chat_id INTEGER NOT NULL,
+			channel_id INTEGER NOT NULL DEFAULT 0,
+			source TEXT NOT NULL DEFAULT 'manual',
+			query TEXT NOT NULL DEFAULT '',
+			content TEXT NOT NULL DEFAULT '',
+			message_id INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_generated_posts_chat ON generated_posts(chat_id, created_at)`,
 	}
 	for _, m := range additionalTables {
 		if _, err := db.conn.Exec(m); err != nil {
@@ -304,6 +334,41 @@ func (db *DB) GetMessageByTelegramID(chatID int64, messageID int) (*Message, err
 		return nil, err
 	}
 	return msg, nil
+}
+
+// GetRecentMediaMessages returns recent messages with vision-compatible media (photo, animation)
+// for a chat. These are always included in LLM context so the agent can "see" recent images.
+// Returns messages in chronological order (oldest first).
+func (db *DB) GetRecentMediaMessages(chatID int64, limit int) ([]*Message, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	rows, err := db.conn.Query(
+		`SELECT id, chat_id, chat_type, message_id, reply_to_message_id, from_user_id, from_username, from_first_name, text, media_type, media_file_id, is_processed, ai_response, created_at
+		 FROM messages WHERE chat_id = ? AND media_type IN ('photo', 'animation') AND media_file_id != ''
+		 ORDER BY created_at DESC LIMIT ?`,
+		chatID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []*Message
+	for rows.Next() {
+		msg := &Message{}
+		if err := rows.Scan(&msg.ID, &msg.ChatID, &msg.ChatType, &msg.MessageID, &msg.ReplyToMessageID,
+			&msg.FromUserID, &msg.FromUsername, &msg.FromFirstName, &msg.Text, &msg.MediaType, &msg.MediaFileID,
+			&msg.IsProcessed, &msg.AIResponse, &msg.CreatedAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, msg)
+	}
+	// Reverse to chronological order
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+	return msgs, nil
 }
 
 // SearchMessages returns recent messages for a chat, used by the search_chat_history sub-agent.
@@ -632,4 +697,162 @@ func (db *DB) ExpireActiveSubscriptions(chatID int64) error {
 		chatID,
 	)
 	return err
+}
+
+// ----- Post Channels -----
+
+// UpsertPostChannel sets the channel where a group's posts are published.
+// One channel per group (UNIQUE on chat_id).
+func (db *DB) UpsertPostChannel(pc *PostChannel) error {
+	_, err := db.conn.Exec(
+		`INSERT INTO post_channels (chat_id, channel_id, title)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT(chat_id) DO UPDATE SET
+			channel_id=excluded.channel_id,
+			title=excluded.title`,
+		pc.ChatID, pc.ChannelID, pc.Title,
+	)
+	return err
+}
+
+// GetPostChannel returns the configured post channel for a group, or nil if none.
+func (db *DB) GetPostChannel(chatID int64) (*PostChannel, error) {
+	pc := &PostChannel{}
+	err := db.conn.QueryRow(
+		`SELECT id, chat_id, channel_id, title, created_at FROM post_channels WHERE chat_id = ?`,
+		chatID,
+	).Scan(&pc.ID, &pc.ChatID, &pc.ChannelID, &pc.Title, &pc.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return pc, nil
+}
+
+// DeletePostChannel removes the post channel for a group.
+func (db *DB) DeletePostChannel(chatID int64) error {
+	_, err := db.conn.Exec(`DELETE FROM post_channels WHERE chat_id = ?`, chatID)
+	return err
+}
+
+// ----- Scheduled Posts -----
+
+// UpsertScheduledPost creates or updates a scheduled post configuration for a group.
+func (db *DB) UpsertScheduledPost(sp *ScheduledPost) error {
+	_, err := db.conn.Exec(
+		`INSERT INTO scheduled_posts (chat_id, interval_hours, is_active, last_posted_at, next_post_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(chat_id) DO UPDATE SET
+			interval_hours=excluded.interval_hours,
+			is_active=excluded.is_active,
+			last_posted_at=excluded.last_posted_at,
+			next_post_at=excluded.next_post_at`,
+		sp.ChatID, sp.IntervalHours, sp.IsActive, sp.LastPostedAt, sp.NextPostAt,
+	)
+	return err
+}
+
+// GetScheduledPost returns the scheduled post config for a group, or nil if none.
+func (db *DB) GetScheduledPost(chatID int64) (*ScheduledPost, error) {
+	sp := &ScheduledPost{}
+	err := db.conn.QueryRow(
+		`SELECT id, chat_id, interval_hours, is_active, last_posted_at, next_post_at, created_at
+		 FROM scheduled_posts WHERE chat_id = ?`,
+		chatID,
+	).Scan(&sp.ID, &sp.ChatID, &sp.IntervalHours, &sp.IsActive, &sp.LastPostedAt, &sp.NextPostAt, &sp.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return sp, nil
+}
+
+// GetDueScheduledPosts returns all active scheduled posts whose next_post_at is in the past.
+func (db *DB) GetDueScheduledPosts() ([]*ScheduledPost, error) {
+	rows, err := db.conn.Query(
+		`SELECT id, chat_id, interval_hours, is_active, last_posted_at, next_post_at, created_at
+		 FROM scheduled_posts WHERE is_active = 1 AND next_post_at <= datetime('now')`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []*ScheduledPost
+	for rows.Next() {
+		sp := &ScheduledPost{}
+		if err := rows.Scan(&sp.ID, &sp.ChatID, &sp.IntervalHours, &sp.IsActive, &sp.LastPostedAt, &sp.NextPostAt, &sp.CreatedAt); err != nil {
+			return nil, err
+		}
+		results = append(results, sp)
+	}
+	return results, nil
+}
+
+// AdvanceScheduledPost updates last_posted_at to now and next_post_at to now + interval.
+func (db *DB) AdvanceScheduledPost(chatID int64) error {
+	_, err := db.conn.Exec(
+		`UPDATE scheduled_posts
+		 SET last_posted_at = datetime('now'),
+			 next_post_at = datetime('now', '+' || interval_hours || ' hours')
+		 WHERE chat_id = ?`,
+		chatID,
+	)
+	return err
+}
+
+// DeactivateScheduledPost disables the schedule for a group.
+func (db *DB) DeactivateScheduledPost(chatID int64) error {
+	_, err := db.conn.Exec(
+		`UPDATE scheduled_posts SET is_active = 0 WHERE chat_id = ?`,
+		chatID,
+	)
+	return err
+}
+
+// ----- Generated Posts -----
+
+// SaveGeneratedPost records a generated and sent post.
+func (db *DB) SaveGeneratedPost(gp *GeneratedPost) error {
+	res, err := db.conn.Exec(
+		`INSERT INTO generated_posts (chat_id, channel_id, source, query, content, message_id)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		gp.ChatID, gp.ChannelID, gp.Source, gp.Query, gp.Content, gp.MessageID,
+	)
+	if err != nil {
+		return err
+	}
+	id, _ := res.LastInsertId()
+	gp.ID = id
+	return nil
+}
+
+// GetRecentGeneratedPosts returns the last N generated posts for a group.
+func (db *DB) GetRecentGeneratedPosts(chatID int64, limit int) ([]*GeneratedPost, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	rows, err := db.conn.Query(
+		`SELECT id, chat_id, channel_id, source, query, content, message_id, created_at
+		 FROM generated_posts WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?`,
+		chatID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []*GeneratedPost
+	for rows.Next() {
+		gp := &GeneratedPost{}
+		if err := rows.Scan(&gp.ID, &gp.ChatID, &gp.ChannelID, &gp.Source, &gp.Query, &gp.Content, &gp.MessageID, &gp.CreatedAt); err != nil {
+			return nil, err
+		}
+		results = append(results, gp)
+	}
+	return results, nil
 }

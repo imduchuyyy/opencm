@@ -174,6 +174,22 @@ func (a *Agent) handleSetupCommand(msg *tgbotapi.Message, text string) {
 		a.db.SetSetupState(userID, 0, StepIdle)
 		a.send(chatID, MsgCancelled)
 
+	// Proactive posting commands
+	case strings.HasPrefix(text, CmdCreatePost):
+		a.handleCreatePost(chatID, userID, msg.From.UserName, text)
+
+	case strings.HasPrefix(text, CmdSetChannel):
+		a.handleSetChannel(chatID, userID, msg.From.UserName, text)
+
+	case strings.HasPrefix(text, CmdSetSchedule):
+		a.handleSetSchedule(chatID, userID, msg.From.UserName, text)
+
+	case text == CmdStopSchedule:
+		a.handleStopSchedule(chatID, userID, msg.From.UserName)
+
+	case text == CmdPostStatus:
+		a.handlePostStatus(chatID, userID)
+
 	// Super admin commands
 	case strings.HasPrefix(text, CmdAdminSearch):
 		a.handleAdminSearch(chatID, msg.From.UserName, text)
@@ -536,6 +552,8 @@ func (a *Agent) sendPlanInfo(chatID, userID int64) {
 		boolStr(limits.WebSearch),
 		boolStr(limits.WebFetch),
 		knowledgeStatus,
+		boolStr(limits.CreatePost),
+		boolStr(limits.SchedulePost),
 	)
 	a.send(chatID, text)
 }
@@ -556,6 +574,266 @@ func stepDisplayName(step string) string {
 		return name
 	}
 	return step
+}
+
+// ----- Proactive Posting handlers -----
+
+// handleCreatePost handles /create_post <link or keyword>
+func (a *Agent) handleCreatePost(chatID, userID int64, username, text string) {
+	groupChatID := a.getSelectedGroupChatID(userID)
+	if groupChatID == 0 {
+		a.send(chatID, MsgNoGroupSelected)
+		return
+	}
+
+	if !a.isAdminOrSuperAdmin(groupChatID, userID, username) {
+		a.send(chatID, MsgNoLongerAdmin)
+		return
+	}
+
+	// Plan check
+	groupCfg := a.getOrCreateGroupConfig(groupChatID)
+	effectivePlan := a.db.GetEffectivePlan(groupChatID)
+	limits := plan.GetLimits(effectivePlan)
+	if !limits.CreatePost && !a.isSuperAdmin(username) {
+		a.send(chatID, MsgCreatePostNoPlan)
+		return
+	}
+	_ = groupCfg
+
+	// Parse query from command
+	parts := strings.SplitN(text, " ", 2)
+	if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+		a.send(chatID, MsgCreatePostUsage)
+		return
+	}
+	query := strings.TrimSpace(parts[1])
+
+	a.send(chatID, MsgCreatePostGenerating)
+
+	ctx := context.Background()
+	content, err := a.generateAndSendPost(ctx, groupChatID, query, "manual")
+	if err != nil {
+		log.Printf("[Posts] Error creating post for group %d: %v", groupChatID, err)
+		a.send(chatID, fmt.Sprintf(MsgCreatePostError, err))
+		return
+	}
+
+	// Show preview to admin
+	preview := content
+	if len(preview) > 500 {
+		preview = preview[:500] + "..."
+	}
+	a.send(chatID, fmt.Sprintf(MsgCreatePostDone, preview))
+}
+
+// handleSetChannel handles /set_channel <channel_id> or /set_channel reset
+func (a *Agent) handleSetChannel(chatID, userID int64, username, text string) {
+	groupChatID := a.getSelectedGroupChatID(userID)
+	if groupChatID == 0 {
+		a.send(chatID, MsgNoGroupSelected)
+		return
+	}
+
+	if !a.isAdminOrSuperAdmin(groupChatID, userID, username) {
+		a.send(chatID, MsgNoLongerAdmin)
+		return
+	}
+
+	parts := strings.SplitN(text, " ", 2)
+	if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+		a.send(chatID, MsgSetChannelUsage)
+		return
+	}
+
+	arg := strings.TrimSpace(parts[1])
+
+	// Handle reset
+	if strings.ToLower(arg) == "reset" {
+		a.db.DeletePostChannel(groupChatID)
+		a.send(chatID, MsgSetChannelReset)
+		return
+	}
+
+	// Parse channel ID
+	channelID, err := strconv.ParseInt(arg, 10, 64)
+	if err != nil {
+		a.send(chatID, MsgSetChannelUsage)
+		return
+	}
+
+	// Verify bot is admin of the channel by trying to get chat info
+	chatInfoCfg := tgbotapi.ChatInfoConfig{
+		ChatConfig: tgbotapi.ChatConfig{ChatID: channelID},
+	}
+	chatInfo, err := a.bot.GetChat(chatInfoCfg)
+	if err != nil {
+		a.send(chatID, MsgSetChannelNotAdmin)
+		return
+	}
+
+	title := chatInfo.Title
+	if title == "" {
+		title = fmt.Sprintf("Channel %d", channelID)
+	}
+
+	pc := &database.PostChannel{
+		ChatID:    groupChatID,
+		ChannelID: channelID,
+		Title:     title,
+	}
+	if err := a.db.UpsertPostChannel(pc); err != nil {
+		a.send(chatID, fmt.Sprintf(MsgSetChannelError, err))
+		return
+	}
+
+	a.send(chatID, fmt.Sprintf(MsgSetChannelDone, title, channelID))
+}
+
+// handleSetSchedule handles /set_schedule <hours>
+func (a *Agent) handleSetSchedule(chatID, userID int64, username, text string) {
+	groupChatID := a.getSelectedGroupChatID(userID)
+	if groupChatID == 0 {
+		a.send(chatID, MsgNoGroupSelected)
+		return
+	}
+
+	if !a.isAdminOrSuperAdmin(groupChatID, userID, username) {
+		a.send(chatID, MsgNoLongerAdmin)
+		return
+	}
+
+	// Plan check
+	effectivePlan := a.db.GetEffectivePlan(groupChatID)
+	limits := plan.GetLimits(effectivePlan)
+	if !limits.SchedulePost && !a.isSuperAdmin(username) {
+		a.send(chatID, MsgSetScheduleNoPlan)
+		return
+	}
+
+	// Check topics are configured
+	groupCfg := a.getOrCreateGroupConfig(groupChatID)
+	if strings.TrimSpace(groupCfg.Topics) == "" {
+		a.send(chatID, MsgSetScheduleNoTopics)
+		return
+	}
+
+	parts := strings.SplitN(text, " ", 2)
+	if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+		a.send(chatID, MsgSetScheduleUsage)
+		return
+	}
+
+	hours, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || hours < 1 || hours > 720 {
+		a.send(chatID, MsgSetScheduleUsage)
+		return
+	}
+
+	now := time.Now().UTC()
+	nextPost := now.Add(time.Duration(hours) * time.Hour)
+
+	sp := &database.ScheduledPost{
+		ChatID:        groupChatID,
+		IntervalHours: hours,
+		IsActive:      true,
+		LastPostedAt:  now,
+		NextPostAt:    nextPost,
+	}
+	if err := a.db.UpsertScheduledPost(sp); err != nil {
+		a.send(chatID, fmt.Sprintf("Error setting schedule: %v", err))
+		return
+	}
+
+	a.send(chatID, fmt.Sprintf(MsgSetScheduleDone, hours, nextPost.Format("Jan 2, 15:04 UTC")))
+}
+
+// handleStopSchedule handles /stop_schedule
+func (a *Agent) handleStopSchedule(chatID, userID int64, username string) {
+	groupChatID := a.getSelectedGroupChatID(userID)
+	if groupChatID == 0 {
+		a.send(chatID, MsgNoGroupSelected)
+		return
+	}
+
+	if !a.isAdminOrSuperAdmin(groupChatID, userID, username) {
+		a.send(chatID, MsgNoLongerAdmin)
+		return
+	}
+
+	sp, err := a.db.GetScheduledPost(groupChatID)
+	if err != nil || sp == nil || !sp.IsActive {
+		a.send(chatID, MsgStopScheduleNone)
+		return
+	}
+
+	if err := a.db.DeactivateScheduledPost(groupChatID); err != nil {
+		a.send(chatID, fmt.Sprintf("Error stopping schedule: %v", err))
+		return
+	}
+
+	a.send(chatID, MsgStopScheduleDone)
+}
+
+// handlePostStatus handles /post_status
+func (a *Agent) handlePostStatus(chatID, userID int64) {
+	groupChatID := a.getSelectedGroupChatID(userID)
+	if groupChatID == 0 {
+		a.send(chatID, MsgNoGroupSelected)
+		return
+	}
+
+	// Get group title
+	groupTitle := fmt.Sprintf("Group %d", groupChatID)
+	if g, err := a.db.GetGroup(groupChatID); err == nil {
+		groupTitle = g.ChatTitle
+	}
+
+	// Channel info
+	channelInfo := "Group chat (default)"
+	pc, err := a.db.GetPostChannel(groupChatID)
+	if err == nil && pc != nil {
+		channelInfo = fmt.Sprintf("%s (ID: %d)", pc.Title, pc.ChannelID)
+	}
+
+	// Schedule info
+	scheduleInfo := "Not configured"
+	lastPost := "Never"
+	nextPost := "N/A"
+	sp, err := a.db.GetScheduledPost(groupChatID)
+	if err == nil && sp != nil {
+		if sp.IsActive {
+			scheduleInfo = fmt.Sprintf("Every %d hours (active)", sp.IntervalHours)
+			nextPost = sp.NextPostAt.Format("Jan 2, 15:04 UTC")
+		} else {
+			scheduleInfo = fmt.Sprintf("Every %d hours (paused)", sp.IntervalHours)
+		}
+		if !sp.LastPostedAt.IsZero() && sp.LastPostedAt.Year() > 1970 {
+			lastPost = sp.LastPostedAt.Format("Jan 2, 15:04 UTC")
+		}
+	}
+
+	// Recent posts
+	recentPosts, _ := a.db.GetRecentGeneratedPosts(groupChatID, 5)
+	recentCount := len(recentPosts)
+	var recentLines string
+	if recentCount > 0 {
+		var lines []string
+		for _, rp := range recentPosts {
+			preview := rp.Query
+			if len(preview) > 60 {
+				preview = preview[:60] + "..."
+			}
+			lines = append(lines, fmt.Sprintf("  [%s] %s - %s",
+				rp.Source, rp.CreatedAt.Format("Jan 2 15:04"), preview))
+		}
+		recentLines = strings.Join(lines, "\n")
+	} else {
+		recentLines = "  (none)"
+	}
+
+	a.send(chatID, fmt.Sprintf(MsgPostStatusFmt,
+		groupTitle, channelInfo, scheduleInfo, lastPost, nextPost, recentCount, recentLines))
 }
 
 // ----- Super Admin handlers -----

@@ -52,6 +52,8 @@ type Limits struct {
 	MaxFileSize     int64 // Max file size for knowledge uploads in bytes (0 = not allowed)
 	WebSearch       bool  // Whether web_search tool is available
 	WebFetch        bool  // Whether web_fetch tool is available
+	CreatePost      bool  // Whether manual post creation (/create_post) is available
+	SchedulePost    bool  // Whether scheduled automatic posting is available
 }
 
 // planLimits maps each plan to its limits
@@ -63,6 +65,8 @@ var planLimits = map[Plan]Limits{
 		MaxFileSize:     0,
 		WebSearch:       false,
 		WebFetch:        false,
+		CreatePost:      false,
+		SchedulePost:    false,
 	},
 	Pro: {
 		MonthlyMessages: 2500,
@@ -71,6 +75,8 @@ var planLimits = map[Plan]Limits{
 		MaxFileSize:     0,
 		WebSearch:       true,
 		WebFetch:        true,
+		CreatePost:      true,
+		SchedulePost:    false,
 	},
 	Max: {
 		MonthlyMessages: 10_000,
@@ -79,6 +85,8 @@ var planLimits = map[Plan]Limits{
 		MaxFileSize:     10 * 1024 * 1024, // 10 MB
 		WebSearch:       true,
 		WebFetch:        true,
+		CreatePost:      true,
+		SchedulePost:    true,
 	},
 	Custom: {
 		MonthlyMessages: 100_000,
@@ -87,6 +95,8 @@ var planLimits = map[Plan]Limits{
 		MaxFileSize:     50 * 1024 * 1024, // 50 MB
 		WebSearch:       true,
 		WebFetch:        true,
+		CreatePost:      true,
+		SchedulePost:    true,
 	},
 }
 

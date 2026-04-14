@@ -81,3 +81,36 @@ type Subscription struct {
 	ExpiresAt               time.Time `json:"expires_at"`
 	CreatedAt               time.Time `json:"created_at"`
 }
+
+// PostChannel stores an optional channel where the bot posts content for a group.
+// If no channel is set, posts go to the group chat itself.
+type PostChannel struct {
+	ID        int64     `json:"id"`
+	ChatID    int64     `json:"chat_id"`    // The group config this belongs to
+	ChannelID int64     `json:"channel_id"` // Telegram channel/chat to post to (can be the group itself)
+	Title     string    `json:"title"`      // Display name
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// ScheduledPost tracks scheduled automatic posting configurations for a group.
+type ScheduledPost struct {
+	ID            int64     `json:"id"`
+	ChatID        int64     `json:"chat_id"`        // The group config this belongs to
+	IntervalHours int       `json:"interval_hours"` // How often to post (in hours, e.g. 24 = daily)
+	IsActive      bool      `json:"is_active"`      // Whether this schedule is active
+	LastPostedAt  time.Time `json:"last_posted_at"` // When the last scheduled post was sent
+	NextPostAt    time.Time `json:"next_post_at"`   // When the next post should be sent
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+// GeneratedPost stores a record of every post the bot has generated and sent.
+type GeneratedPost struct {
+	ID        int64     `json:"id"`
+	ChatID    int64     `json:"chat_id"`    // Group config it belongs to
+	ChannelID int64     `json:"channel_id"` // Where it was posted
+	Source    string    `json:"source"`     // "manual" or "scheduled"
+	Query     string    `json:"query"`      // The link/keyword/topic that triggered the post
+	Content   string    `json:"content"`    // The generated post text
+	MessageID int       `json:"message_id"` // Telegram message ID of the posted message
+	CreatedAt time.Time `json:"created_at"`
+}
