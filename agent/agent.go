@@ -50,6 +50,7 @@ func (a *Agent) Start(ctx context.Context) {
 	go a.pollMessages(ctx)
 	go a.processLoop(ctx)
 	go a.scheduledPostLoop(ctx)
+	go a.engagementLoop(ctx)
 
 	log.Printf("[Agent] Running as @%s", a.bot.Self.UserName)
 
@@ -260,6 +261,12 @@ func (a *Agent) handleUpdate(update tgbotapi.Update) {
 		return
 	}
 
+	// Handle new chat members (welcome/onboarding)
+	if msg.NewChatMembers != nil && len(msg.NewChatMembers) > 0 {
+		a.handleNewChatMembers(msg)
+		return
+	}
+
 	// Log received message
 	logText := msg.Text
 	if logText == "" && msg.Caption != "" {
@@ -298,7 +305,7 @@ func (a *Agent) handleUpdate(update tgbotapi.Update) {
 		})
 		// Track that this user is in this group
 		if msg.From != nil {
-			a.db.UpsertGroupMember(msg.Chat.ID, msg.From.ID)
+			a.db.UpsertGroupMember(msg.Chat.ID, msg.From.ID, msg.From.UserName, msg.From.FirstName)
 		}
 	}
 
@@ -446,6 +453,28 @@ func (a *Agent) processScheduledPosts(ctx context.Context) {
 		// Advance to next scheduled time
 		if err := a.db.AdvanceScheduledPost(sp.ChatID); err != nil {
 			log.Printf("[Posts] Error advancing schedule for group %d: %v", sp.ChatID, err)
+		}
+	}
+}
+
+// engagementLoop runs every 5 minutes to check for inactive groups and post engagement content.
+func (a *Agent) engagementLoop(ctx context.Context) {
+	// Initial delay
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(60 * time.Second):
+	}
+
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.checkInactivityAndEngage(ctx)
 		}
 	}
 }
@@ -827,6 +856,9 @@ func toolStatusText(toolCalls []llm.ToolCall) string {
 		"send_poll":           "Creating poll...",
 		"get_config":          "Reading configuration...",
 		"set_config":          "Updating configuration...",
+		"delete_message":      "Moderating...",
+		"warn_user":           "Issuing warning...",
+		"ban_user":            "Banning user...",
 	}
 
 	// If there's a single tool call, show its specific status
@@ -839,7 +871,7 @@ func toolStatusText(toolCalls []llm.ToolCall) string {
 
 	// Multiple tool calls - show the most interesting one
 	// Priority: web_search > web_fetch > others
-	priority := []string{"web_search", "web_fetch", "search_chat_history", "send_poll", "set_config"}
+	priority := []string{"web_search", "web_fetch", "search_chat_history", "delete_message", "ban_user", "send_poll", "set_config"}
 	for _, p := range priority {
 		for _, tc := range toolCalls {
 			if tc.Name == p {
@@ -1019,6 +1051,12 @@ func buildSystemPrompt(cfg *database.GroupConfig, gc *GroupContext, botUsername,
 - You have access to a file_search tool that searches uploaded knowledge documents.
 - ONLY use file_search when someone asks a specific question that likely requires information from the knowledge base.
 - Do NOT use file_search for casual messages, greetings, general chat, or questions you can answer from context alone.`)
+
+	parts = append(parts, `## Moderation
+- You have access to delete_message, warn_user, and ban_user tools for moderation.
+- Use these to enforce group rules when you see clear violations.
+- Always explain WHY you're taking moderation action.
+- Prefer warning before banning unless the violation is severe (spam/scam/phishing).`)
 
 	return strings.Join(parts, "\n\n")
 }

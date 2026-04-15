@@ -28,6 +28,13 @@ const (
 	CmdStopSchedule = "/stop_schedule"
 	CmdPostStatus   = "/post_status"
 
+	// Welcome/onboarding commands
+	CmdSetWelcome = "/set_welcome"
+	CmdSetRules   = "/set_rules"
+
+	// Analytics commands
+	CmdReport = "/report"
+
 	// Super admin commands
 	CmdAdminSearch  = "/admin_search"
 	CmdAdminSetPlan = "/admin_set_plan"
@@ -131,12 +138,17 @@ const (
 		CmdAddKnowledge + " - Upload a file (PDF, .md, .txt)\n" +
 		CmdAddURL + " - Add knowledge from a URL\n" +
 		CmdListKnowledge + " - View all knowledge entries\n\n" +
+		"Welcome & Moderation:\n" +
+		CmdSetWelcome + " - Set AI welcome guidance for new members\n" +
+		CmdSetRules + " - Set group rules\n\n" +
 		"Proactive Posting:\n" +
 		CmdCreatePost + " <link/keyword> - Research and post content (Pro+)\n" +
 		CmdSetChannel + " <channel_id> - Set post destination channel\n" +
 		CmdSetSchedule + " <hours> - Auto-post on schedule (Max+)\n" +
 		CmdStopSchedule + " - Stop auto-posting\n" +
 		CmdPostStatus + " - View posting status\n\n" +
+		"Analytics:\n" +
+		CmdReport + " - View group analytics and chat summary\n\n" +
 		"Subscription:\n" +
 		CmdPlan + " - View plan and usage\n" +
 		CmdSubscribePro + " - Upgrade to Pro ($19/mo)\n" +
@@ -160,12 +172,17 @@ const (
 		CmdAddURL + " - Add knowledge from URL\n" +
 		CmdListKnowledge + " - List all knowledge\n" +
 		CmdDeleteKnowledge + " <id> - Delete a knowledge entry\n\n" +
+		"Welcome & Moderation:\n" +
+		CmdSetWelcome + " - Set AI welcome guidance for new members\n" +
+		CmdSetRules + " - Set group rules\n\n" +
 		"Proactive Posting:\n" +
 		CmdCreatePost + " <link/keyword> - Research and post (Pro+)\n" +
 		CmdSetChannel + " <channel_id> - Set post channel\n" +
 		CmdSetSchedule + " <hours> - Auto-post schedule (Max+)\n" +
 		CmdStopSchedule + " - Stop auto-posting\n" +
 		CmdPostStatus + " - View posting status\n\n" +
+		"Analytics:\n" +
+		CmdReport + " - View group analytics and chat summary\n\n" +
 		"Subscription:\n" +
 		CmdPlan + " - View plan and usage\n" +
 		CmdSubscribePro + " - Upgrade to Pro\n" +
@@ -244,4 +261,23 @@ const (
 		CmdAdminSetPlan + " <chat_id> <plan> - Set a group's plan (free/pro/max/custom)\n" +
 		CmdAdminHelp + " - Show this message\n\n" +
 		"These commands bypass normal admin checks and payment requirements."
+
+	// Welcome/onboarding messages
+	MsgPromptWelcome  = "Send me guidance for welcome messages.\n\nThe bot uses AI to write a personalized welcome for each new member. This guidance tells the AI what to include or how to greet people.\n\nExample:\n\"Mention that we're a friendly crypto trading group. Point them to the pinned FAQ. Keep it casual.\""
+	MsgPromptRules    = "Send me the group rules.\n\nThese will be included as context when generating welcome messages and can be pinned in the group.\n\nExample:\n\"1. Be respectful\n2. No spam or self-promotion\n3. Stay on topic\n4. English only\""
+	MsgWelcomeUpdated = "Welcome guidance updated!\n\nThe AI will use this guidance when welcoming new members."
+	MsgRulesUpdated   = "Rules updated!\n\nRules will be included as context for welcome messages."
+
+	// Report/analytics messages
+	MsgReportHeader = "Analytics Report for: %s\nPeriod: Last %d days\n\n" +
+		"Members:\n" +
+		"  Total tracked: %d\n" +
+		"  Active (7d): %d\n" +
+		"  New (%dd): %d\n\n" +
+		"Messages:\n%s\n\n" +
+		"Top Posters:\n%s\n\n" +
+		"Moderation:\n" +
+		"  Actions (%dd): %d\n\n" +
+		"Plan: %s | Usage: %d/%d msgs this month\n\n" +
+		"Chat Summary:\n%s"
 )

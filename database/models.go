@@ -8,17 +8,21 @@ import (
 
 // GroupConfig holds the AI agent configuration for a specific group
 type GroupConfig struct {
-	ID              int64     `json:"id"`
-	ChatID          int64     `json:"chat_id"` // Telegram chat ID (group/supergroup)
-	Plan            plan.Plan `json:"plan"`    // Subscription tier: free, pro, max
-	SystemPrompt    string    `json:"system_prompt"`
-	Bio             string    `json:"bio"`
-	Topics          string    `json:"topics"`
-	MessageExamples string    `json:"message_examples"`
-	ChatStyle       string    `json:"chat_style"`
-	VectorStoreID   string    `json:"vector_store_id"` // OpenAI vector store ID for file search
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ID                   int64     `json:"id"`
+	ChatID               int64     `json:"chat_id"` // Telegram chat ID (group/supergroup)
+	Plan                 plan.Plan `json:"plan"`    // Subscription tier: free, pro, max
+	SystemPrompt         string    `json:"system_prompt"`
+	Bio                  string    `json:"bio"`
+	Topics               string    `json:"topics"`
+	MessageExamples      string    `json:"message_examples"`
+	ChatStyle            string    `json:"chat_style"`
+	VectorStoreID        string    `json:"vector_store_id"`        // OpenAI vector store ID for file search
+	WelcomeMessage       string    `json:"welcome_message"`        // Message sent to new members
+	RulesText            string    `json:"rules_text"`             // Group rules text
+	SpamSensitivity      string    `json:"spam_sensitivity"`       // "low", "medium", "high"
+	SummaryIntervalHours int       `json:"summary_interval_hours"` // 0 = disabled, >0 = auto-summarize every N hours
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
 }
 
 // Group tracks which groups the bot has been added to
@@ -113,4 +117,39 @@ type GeneratedPost struct {
 	Content   string    `json:"content"`    // The generated post text
 	MessageID int       `json:"message_id"` // Telegram message ID of the posted message
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// MemberProfile tracks per-member stats and personality for a group
+type MemberProfile struct {
+	ID               int64     `json:"id"`
+	ChatID           int64     `json:"chat_id"`
+	UserID           int64     `json:"user_id"`
+	Username         string    `json:"username"`
+	FirstName        string    `json:"first_name"`
+	MessageCount     int       `json:"message_count"`
+	PersonalityNotes string    `json:"personality_notes"` // LLM-generated personality summary
+	FirstSeenAt      time.Time `json:"first_seen_at"`
+	LastSeenAt       time.Time `json:"last_seen_at"`
+}
+
+// ModAction logs a moderation action taken by the bot
+type ModAction struct {
+	ID        int64     `json:"id"`
+	ChatID    int64     `json:"chat_id"`
+	UserID    int64     `json:"user_id"`    // Target user
+	Action    string    `json:"action"`     // "delete", "warn", "mute", "ban"
+	Reason    string    `json:"reason"`     // Why the action was taken
+	MessageID int       `json:"message_id"` // The message that triggered the action (0 if N/A)
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// ChatSummary stores auto-generated chat summaries
+type ChatSummary struct {
+	ID         int64     `json:"id"`
+	ChatID     int64     `json:"chat_id"`
+	PeriodFrom time.Time `json:"period_from"` // Start of the summarized period
+	PeriodTo   time.Time `json:"period_to"`   // End of the summarized period
+	Summary    string    `json:"summary"`     // LLM-generated summary text
+	MessageID  int       `json:"message_id"`  // Telegram message ID where summary was posted (0 if not posted)
+	CreatedAt  time.Time `json:"created_at"`
 }

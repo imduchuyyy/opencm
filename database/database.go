@@ -106,6 +106,16 @@ func (db *DB) migrate() error {
 	// Additive column migrations (ignore error if column already exists)
 	addColumns := []string{
 		`ALTER TABLE group_configs ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'`,
+		`ALTER TABLE group_configs ADD COLUMN welcome_message TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE group_configs ADD COLUMN rules_text TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE group_configs ADD COLUMN spam_sensitivity TEXT NOT NULL DEFAULT 'medium'`,
+		`ALTER TABLE group_configs ADD COLUMN summary_interval_hours INTEGER NOT NULL DEFAULT 0`,
+		// Expand group_members with profile fields
+		`ALTER TABLE group_members ADD COLUMN username TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE group_members ADD COLUMN first_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE group_members ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE group_members ADD COLUMN personality_notes TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE group_members ADD COLUMN first_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP`,
 	}
 	for _, m := range addColumns {
 		db.conn.Exec(m) // ignore error (column may already exist)
@@ -164,6 +174,28 @@ func (db *DB) migrate() error {
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_generated_posts_chat ON generated_posts(chat_id, created_at)`,
+		// Moderation actions log
+		`CREATE TABLE IF NOT EXISTS mod_actions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			chat_id INTEGER NOT NULL,
+			user_id INTEGER NOT NULL,
+			action TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL DEFAULT '',
+			message_id INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_mod_actions_chat ON mod_actions(chat_id, created_at)`,
+		// Chat summaries
+		`CREATE TABLE IF NOT EXISTS chat_summaries (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			chat_id INTEGER NOT NULL,
+			period_from DATETIME NOT NULL,
+			period_to DATETIME NOT NULL,
+			summary TEXT NOT NULL DEFAULT '',
+			message_id INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_chat_summaries_chat ON chat_summaries(chat_id, created_at)`,
 	}
 	for _, m := range additionalTables {
 		if _, err := db.conn.Exec(m); err != nil {
@@ -178,8 +210,8 @@ func (db *DB) migrate() error {
 
 func (db *DB) UpsertGroupConfig(cfg *GroupConfig) error {
 	_, err := db.conn.Exec(
-		`INSERT INTO group_configs (chat_id, plan, system_prompt, bio, topics, message_examples, chat_style, vector_store_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO group_configs (chat_id, plan, system_prompt, bio, topics, message_examples, chat_style, vector_store_id, welcome_message, rules_text, spam_sensitivity, summary_interval_hours)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(chat_id) DO UPDATE SET
 			plan=excluded.plan,
 			system_prompt=excluded.system_prompt,
@@ -188,9 +220,13 @@ func (db *DB) UpsertGroupConfig(cfg *GroupConfig) error {
 			message_examples=excluded.message_examples,
 			chat_style=excluded.chat_style,
 			vector_store_id=excluded.vector_store_id,
+			welcome_message=excluded.welcome_message,
+			rules_text=excluded.rules_text,
+			spam_sensitivity=excluded.spam_sensitivity,
+			summary_interval_hours=excluded.summary_interval_hours,
 			updated_at=CURRENT_TIMESTAMP`,
 		cfg.ChatID, string(cfg.Plan), cfg.SystemPrompt, cfg.Bio, cfg.Topics, cfg.MessageExamples, cfg.ChatStyle,
-		cfg.VectorStoreID,
+		cfg.VectorStoreID, cfg.WelcomeMessage, cfg.RulesText, cfg.SpamSensitivity, cfg.SummaryIntervalHours,
 	)
 	return err
 }
@@ -200,10 +236,11 @@ func (db *DB) GetGroupConfig(chatID int64) (*GroupConfig, error) {
 	var planStr string
 	err := db.conn.QueryRow(
 		`SELECT id, chat_id, plan, system_prompt, bio, topics, message_examples, chat_style, vector_store_id,
+			welcome_message, rules_text, spam_sensitivity, summary_interval_hours,
 			created_at, updated_at
 		 FROM group_configs WHERE chat_id = ?`, chatID,
 	).Scan(&cfg.ID, &cfg.ChatID, &planStr, &cfg.SystemPrompt, &cfg.Bio, &cfg.Topics, &cfg.MessageExamples, &cfg.ChatStyle,
-		&cfg.VectorStoreID,
+		&cfg.VectorStoreID, &cfg.WelcomeMessage, &cfg.RulesText, &cfg.SpamSensitivity, &cfg.SummaryIntervalHours,
 		&cfg.CreatedAt, &cfg.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -219,7 +256,8 @@ func (db *DB) UpdateGroupConfigField(chatID int64, field, value string) error {
 	allowed := map[string]bool{
 		"system_prompt": true, "bio": true, "topics": true,
 		"message_examples": true, "chat_style": true,
-		"vector_store_id": true,
+		"vector_store_id": true, "welcome_message": true,
+		"rules_text": true, "spam_sensitivity": true,
 	}
 	if !allowed[field] {
 		return fmt.Errorf("unknown field: %s", field)
@@ -510,6 +548,207 @@ func (db *DB) ListKnowledge(chatID int64) ([]*Knowledge, error) {
 	return results, nil
 }
 
+// ----- Moderation Actions -----
+
+// LogModAction records a moderation action
+func (db *DB) LogModAction(action *ModAction) error {
+	res, err := db.conn.Exec(
+		`INSERT INTO mod_actions (chat_id, user_id, action, reason, message_id)
+		 VALUES (?, ?, ?, ?, ?)`,
+		action.ChatID, action.UserID, action.Action, action.Reason, action.MessageID,
+	)
+	if err != nil {
+		return err
+	}
+	id, _ := res.LastInsertId()
+	action.ID = id
+	action.CreatedAt = time.Now()
+	return nil
+}
+
+// GetRecentModActions returns recent moderation actions for a group
+func (db *DB) GetRecentModActions(chatID int64, limit int) ([]*ModAction, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := db.conn.Query(
+		`SELECT id, chat_id, user_id, action, reason, message_id, created_at
+		 FROM mod_actions WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?`,
+		chatID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var actions []*ModAction
+	for rows.Next() {
+		a := &ModAction{}
+		if err := rows.Scan(&a.ID, &a.ChatID, &a.UserID, &a.Action, &a.Reason, &a.MessageID, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		actions = append(actions, a)
+	}
+	return actions, nil
+}
+
+// GetModActionCount returns the number of moderation actions for a group in a time period
+func (db *DB) GetModActionCount(chatID int64, since time.Time) (int, error) {
+	var count int
+	err := db.conn.QueryRow(
+		`SELECT COUNT(*) FROM mod_actions WHERE chat_id = ? AND created_at >= ?`,
+		chatID, since,
+	).Scan(&count)
+	return count, err
+}
+
+// ----- Chat Summaries -----
+
+// SaveChatSummary records a generated chat summary
+func (db *DB) SaveChatSummary(summary *ChatSummary) error {
+	res, err := db.conn.Exec(
+		`INSERT INTO chat_summaries (chat_id, period_from, period_to, summary, message_id)
+		 VALUES (?, ?, ?, ?, ?)`,
+		summary.ChatID, summary.PeriodFrom, summary.PeriodTo, summary.Summary, summary.MessageID,
+	)
+	if err != nil {
+		return err
+	}
+	id, _ := res.LastInsertId()
+	summary.ID = id
+	summary.CreatedAt = time.Now()
+	return nil
+}
+
+// GetLastChatSummary returns the most recent summary for a group
+func (db *DB) GetLastChatSummary(chatID int64) (*ChatSummary, error) {
+	s := &ChatSummary{}
+	err := db.conn.QueryRow(
+		`SELECT id, chat_id, period_from, period_to, summary, message_id, created_at
+		 FROM chat_summaries WHERE chat_id = ? ORDER BY created_at DESC LIMIT 1`,
+		chatID,
+	).Scan(&s.ID, &s.ChatID, &s.PeriodFrom, &s.PeriodTo, &s.Summary, &s.MessageID, &s.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// GetMessagesSince returns messages for a chat since a given time (chronological order)
+func (db *DB) GetMessagesSince(chatID int64, since time.Time, limit int) ([]*Message, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := db.conn.Query(
+		`SELECT id, chat_id, chat_type, message_id, reply_to_message_id, from_user_id, from_username, from_first_name, text, media_type, media_file_id, is_processed, ai_response, created_at
+		 FROM messages WHERE chat_id = ? AND created_at >= ? AND text != '' ORDER BY created_at ASC LIMIT ?`,
+		chatID, since, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []*Message
+	for rows.Next() {
+		msg := &Message{}
+		if err := rows.Scan(&msg.ID, &msg.ChatID, &msg.ChatType, &msg.MessageID, &msg.ReplyToMessageID,
+			&msg.FromUserID, &msg.FromUsername, &msg.FromFirstName, &msg.Text, &msg.MediaType, &msg.MediaFileID,
+			&msg.IsProcessed, &msg.AIResponse, &msg.CreatedAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, msg)
+	}
+	return msgs, nil
+}
+
+// GetLastMessageTime returns the timestamp of the last message in a group (any sender)
+func (db *DB) GetLastMessageTime(chatID int64) (time.Time, error) {
+	var t time.Time
+	err := db.conn.QueryRow(
+		`SELECT COALESCE(MAX(created_at), datetime('1970-01-01')) FROM messages WHERE chat_id = ?`, chatID,
+	).Scan(&t)
+	return t, err
+}
+
+// UpdateGroupConfigSummaryInterval updates the summary_interval_hours field
+func (db *DB) UpdateGroupConfigSummaryInterval(chatID int64, hours int) error {
+	_, err := db.conn.Exec(
+		`UPDATE group_configs SET summary_interval_hours = ?, updated_at = CURRENT_TIMESTAMP WHERE chat_id = ?`,
+		hours, chatID,
+	)
+	return err
+}
+
+// GetGroupsWithSummaryEnabled returns all groups that have auto-summary enabled
+func (db *DB) GetGroupsWithSummaryEnabled() ([]*GroupConfig, error) {
+	rows, err := db.conn.Query(
+		`SELECT id, chat_id, plan, system_prompt, bio, topics, message_examples, chat_style, vector_store_id,
+			welcome_message, rules_text, spam_sensitivity, summary_interval_hours,
+			created_at, updated_at
+		 FROM group_configs WHERE summary_interval_hours > 0`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var configs []*GroupConfig
+	for rows.Next() {
+		cfg := &GroupConfig{}
+		var planStr string
+		if err := rows.Scan(&cfg.ID, &cfg.ChatID, &planStr, &cfg.SystemPrompt, &cfg.Bio, &cfg.Topics, &cfg.MessageExamples, &cfg.ChatStyle,
+			&cfg.VectorStoreID, &cfg.WelcomeMessage, &cfg.RulesText, &cfg.SpamSensitivity, &cfg.SummaryIntervalHours,
+			&cfg.CreatedAt, &cfg.UpdatedAt); err != nil {
+			return nil, err
+		}
+		cfg.Plan = plan.Plan(planStr)
+		if !cfg.Plan.Valid() {
+			cfg.Plan = plan.Free
+		}
+		configs = append(configs, cfg)
+	}
+	return configs, nil
+}
+
+// ----- Analytics Queries -----
+
+// GetDailyMessageCount returns the number of messages per day for the last N days
+func (db *DB) GetDailyMessageCount(chatID int64, days int) (map[string]int, error) {
+	result := make(map[string]int)
+	rows, err := db.conn.Query(
+		`SELECT date(created_at) as day, COUNT(*) as cnt
+		 FROM messages WHERE chat_id = ? AND created_at >= datetime('now', ? || ' days')
+		 GROUP BY day ORDER BY day ASC`,
+		chatID, fmt.Sprintf("-%d", days),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var day string
+		var count int
+		if err := rows.Scan(&day, &count); err != nil {
+			return nil, err
+		}
+		result[day] = count
+	}
+	return result, nil
+}
+
+// GetNewMembersCount returns number of new members (first_seen_at) in the last N days
+func (db *DB) GetNewMembersCount(chatID int64, days int) (int, error) {
+	var count int
+	err := db.conn.QueryRow(
+		`SELECT COUNT(*) FROM group_members
+		 WHERE chat_id = ? AND first_seen_at >= datetime('now', ? || ' days')`,
+		chatID, fmt.Sprintf("-%d", days),
+	).Scan(&count)
+	return count, err
+}
+
 func (db *DB) GetKnowledge(id int64) (*Knowledge, error) {
 	k := &Knowledge{}
 	err := db.conn.QueryRow(
@@ -529,15 +768,117 @@ func (db *DB) DeleteKnowledge(id, chatID int64) error {
 
 // ----- Group Members -----
 
-// UpsertGroupMember records that a user was seen in a group
-func (db *DB) UpsertGroupMember(chatID, userID int64) error {
+// UpsertGroupMember records that a user was seen in a group, tracks profile data
+func (db *DB) UpsertGroupMember(chatID, userID int64, username, firstName string) error {
 	_, err := db.conn.Exec(
-		`INSERT INTO group_members (chat_id, user_id, last_seen_at)
-		 VALUES (?, ?, CURRENT_TIMESTAMP)
-		 ON CONFLICT(chat_id, user_id) DO UPDATE SET last_seen_at=CURRENT_TIMESTAMP`,
-		chatID, userID,
+		`INSERT INTO group_members (chat_id, user_id, username, first_name, message_count, first_seen_at, last_seen_at)
+		 VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+		 ON CONFLICT(chat_id, user_id) DO UPDATE SET
+			username=excluded.username,
+			first_name=excluded.first_name,
+			message_count=message_count+1,
+			last_seen_at=CURRENT_TIMESTAMP`,
+		chatID, userID, username, firstName,
 	)
 	return err
+}
+
+// GetMemberProfile returns a single member's profile
+func (db *DB) GetMemberProfile(chatID, userID int64) (*MemberProfile, error) {
+	m := &MemberProfile{}
+	err := db.conn.QueryRow(
+		`SELECT id, chat_id, user_id, username, first_name, message_count, personality_notes, first_seen_at, last_seen_at
+		 FROM group_members WHERE chat_id = ? AND user_id = ?`,
+		chatID, userID,
+	).Scan(&m.ID, &m.ChatID, &m.UserID, &m.Username, &m.FirstName, &m.MessageCount, &m.PersonalityNotes, &m.FirstSeenAt, &m.LastSeenAt)
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// GetTopMembers returns the top N members by message count for a group
+func (db *DB) GetTopMembers(chatID int64, limit int) ([]*MemberProfile, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := db.conn.Query(
+		`SELECT id, chat_id, user_id, username, first_name, message_count, personality_notes, first_seen_at, last_seen_at
+		 FROM group_members WHERE chat_id = ? AND message_count > 0
+		 ORDER BY message_count DESC LIMIT ?`,
+		chatID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var members []*MemberProfile
+	for rows.Next() {
+		m := &MemberProfile{}
+		if err := rows.Scan(&m.ID, &m.ChatID, &m.UserID, &m.Username, &m.FirstName, &m.MessageCount, &m.PersonalityNotes, &m.FirstSeenAt, &m.LastSeenAt); err != nil {
+			return nil, err
+		}
+		members = append(members, m)
+	}
+	return members, nil
+}
+
+// GetActiveMembersCount returns the number of distinct members active in the last N days
+func (db *DB) GetActiveMembersCount(chatID int64, days int) (int, error) {
+	var count int
+	err := db.conn.QueryRow(
+		`SELECT COUNT(DISTINCT user_id) FROM group_members
+		 WHERE chat_id = ? AND last_seen_at >= datetime('now', ? || ' days')`,
+		chatID, fmt.Sprintf("-%d", days),
+	).Scan(&count)
+	return count, err
+}
+
+// GetTotalMembersCount returns total tracked members for a group
+func (db *DB) GetTotalMembersCount(chatID int64) (int, error) {
+	var count int
+	err := db.conn.QueryRow(
+		`SELECT COUNT(*) FROM group_members WHERE chat_id = ?`, chatID,
+	).Scan(&count)
+	return count, err
+}
+
+// UpdateMemberPersonality updates the LLM-generated personality notes for a member
+func (db *DB) UpdateMemberPersonality(chatID, userID int64, notes string) error {
+	_, err := db.conn.Exec(
+		`UPDATE group_members SET personality_notes = ? WHERE chat_id = ? AND user_id = ?`,
+		notes, chatID, userID,
+	)
+	return err
+}
+
+// GetMembersNeedingProfile returns members with enough messages but no personality notes yet
+func (db *DB) GetMembersNeedingProfile(chatID int64, minMessages int, limit int) ([]*MemberProfile, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	rows, err := db.conn.Query(
+		`SELECT id, chat_id, user_id, username, first_name, message_count, personality_notes, first_seen_at, last_seen_at
+		 FROM group_members
+		 WHERE chat_id = ? AND message_count >= ? AND personality_notes = ''
+		 ORDER BY message_count DESC LIMIT ?`,
+		chatID, minMessages, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var members []*MemberProfile
+	for rows.Next() {
+		m := &MemberProfile{}
+		if err := rows.Scan(&m.ID, &m.ChatID, &m.UserID, &m.Username, &m.FirstName, &m.MessageCount, &m.PersonalityNotes, &m.FirstSeenAt, &m.LastSeenAt); err != nil {
+			return nil, err
+		}
+		members = append(members, m)
+	}
+	return members, nil
 }
 
 // GetUserGroups returns active groups where the given user has been seen

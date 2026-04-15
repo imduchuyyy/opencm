@@ -152,6 +152,80 @@ func GetAvailableTools(limits plan.Limits) []llm.ToolDef {
 		},
 	})
 
+	// Moderation tools
+	tools = append(tools, llm.ToolDef{
+		Name:        "delete_message",
+		Description: "Delete a message in the group. Use this for spam, rule violations, or inappropriate content. The bot must be a group admin with delete permissions.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"chat_id": map[string]interface{}{
+					"type":        "integer",
+					"description": "The chat ID where the message is",
+				},
+				"message_id": map[string]interface{}{
+					"type":        "integer",
+					"description": "The message ID to delete",
+				},
+				"reason": map[string]interface{}{
+					"type":        "string",
+					"description": "Reason for deleting the message",
+				},
+				"user_id": map[string]interface{}{
+					"type":        "integer",
+					"description": "The user ID of the message author (for logging)",
+				},
+			},
+			"required": []string{"chat_id", "message_id", "reason"},
+		},
+	})
+
+	tools = append(tools, llm.ToolDef{
+		Name:        "warn_user",
+		Description: "Send a warning message to a user in the group. Use this for minor rule violations before escalating to a ban.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"chat_id": map[string]interface{}{
+					"type":        "integer",
+					"description": "The chat ID",
+				},
+				"user_id": map[string]interface{}{
+					"type":        "integer",
+					"description": "The user ID to warn",
+				},
+				"reason": map[string]interface{}{
+					"type":        "string",
+					"description": "Reason for the warning",
+				},
+			},
+			"required": []string{"chat_id", "user_id", "reason"},
+		},
+	})
+
+	tools = append(tools, llm.ToolDef{
+		Name:        "ban_user",
+		Description: "Ban a user from the group. Use this only for severe or repeated violations (spam, scam, harassment). The bot must be a group admin with ban permissions.",
+		Parameters: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"chat_id": map[string]interface{}{
+					"type":        "integer",
+					"description": "The chat ID",
+				},
+				"user_id": map[string]interface{}{
+					"type":        "integer",
+					"description": "The user ID to ban",
+				},
+				"reason": map[string]interface{}{
+					"type":        "string",
+					"description": "Reason for banning the user",
+				},
+			},
+			"required": []string{"chat_id", "user_id", "reason"},
+		},
+	})
+
 	return tools
 }
 
@@ -170,6 +244,12 @@ func (e *Executor) Execute(tc llm.ToolCall) (string, error) {
 		return e.getConfig()
 	case "set_config":
 		return e.setConfig(tc.Arguments)
+	case "delete_message":
+		return e.deleteMessage(tc.Arguments)
+	case "warn_user":
+		return e.warnUser(tc.Arguments)
+	case "ban_user":
+		return e.banUser(tc.Arguments)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", tc.Name)
 	}
@@ -434,6 +514,118 @@ func (e *Executor) setConfig(args map[string]interface{}) (string, error) {
 	}
 
 	return fmt.Sprintf("Unknown config field: %s. Available fields: system_prompt, bio, topics, chat_style, message_examples", field), nil
+}
+
+// ----- Moderation Tools -----
+
+func (e *Executor) deleteMessage(args map[string]interface{}) (string, error) {
+	chatIDFloat, ok := args["chat_id"].(float64)
+	if !ok {
+		chatIDFloat = float64(e.chatID) // Default to current chat
+	}
+	chatID := int64(chatIDFloat)
+
+	msgIDFloat, ok := args["message_id"].(float64)
+	if !ok {
+		return "", fmt.Errorf("message_id is required")
+	}
+	msgID := int(msgIDFloat)
+
+	reason, _ := args["reason"].(string)
+	if reason == "" {
+		reason = "moderation"
+	}
+
+	userID := int64(0)
+	if uid, ok := args["user_id"].(float64); ok {
+		userID = int64(uid)
+	}
+
+	deleteMsg := tgbotapi.NewDeleteMessage(chatID, msgID)
+	if _, err := e.bot.Request(deleteMsg); err != nil {
+		return "", fmt.Errorf("delete message: %w", err)
+	}
+
+	// Log the action
+	e.db.LogModAction(&database.ModAction{
+		ChatID:    chatID,
+		UserID:    userID,
+		Action:    "delete",
+		Reason:    reason,
+		MessageID: msgID,
+	})
+
+	return fmt.Sprintf("Message %d deleted. Reason: %s", msgID, reason), nil
+}
+
+func (e *Executor) warnUser(args map[string]interface{}) (string, error) {
+	chatIDFloat, ok := args["chat_id"].(float64)
+	if !ok {
+		chatIDFloat = float64(e.chatID)
+	}
+	chatID := int64(chatIDFloat)
+
+	userIDFloat, ok := args["user_id"].(float64)
+	if !ok {
+		return "", fmt.Errorf("user_id is required")
+	}
+	userID := int64(userIDFloat)
+
+	reason, _ := args["reason"].(string)
+	if reason == "" {
+		reason = "rule violation"
+	}
+
+	// Log the action
+	e.db.LogModAction(&database.ModAction{
+		ChatID: chatID,
+		UserID: userID,
+		Action: "warn",
+		Reason: reason,
+	})
+
+	return fmt.Sprintf("Warning logged for user %d. Reason: %s. (Include the warning in your reply message to the user.)", userID, reason), nil
+}
+
+func (e *Executor) banUser(args map[string]interface{}) (string, error) {
+	chatIDFloat, ok := args["chat_id"].(float64)
+	if !ok {
+		chatIDFloat = float64(e.chatID)
+	}
+	chatID := int64(chatIDFloat)
+
+	userIDFloat, ok := args["user_id"].(float64)
+	if !ok {
+		return "", fmt.Errorf("user_id is required")
+	}
+	userID := int64(userIDFloat)
+
+	reason, _ := args["reason"].(string)
+	if reason == "" {
+		reason = "severe violation"
+	}
+
+	// Ban the user
+	banConfig := tgbotapi.BanChatMemberConfig{
+		ChatMemberConfig: tgbotapi.ChatMemberConfig{
+			ChatID: chatID,
+			UserID: userID,
+		},
+	}
+
+	if _, err := e.bot.Request(banConfig); err != nil {
+		return "", fmt.Errorf("ban user: %w", err)
+	}
+
+	// Log the action
+	e.db.LogModAction(&database.ModAction{
+		ChatID: chatID,
+		UserID: userID,
+		Action: "ban",
+		Reason: reason,
+	})
+
+	return fmt.Sprintf("User %d has been banned. Reason: %s", userID, reason), nil
 }
 
 // ----- Chat History Search (sub-agent) -----

@@ -28,6 +28,8 @@ const (
 	StepChatStyle       = "chat_style"
 	StepKnowledgeFile   = "knowledge_file"
 	StepKnowledgeURL    = "knowledge_url"
+	StepWelcome         = "welcome"
+	StepRules           = "rules"
 )
 
 // Allowed file extensions for knowledge uploads
@@ -190,6 +192,17 @@ func (a *Agent) handleSetupCommand(msg *tgbotapi.Message, text string) {
 	case text == CmdPostStatus:
 		a.handlePostStatus(chatID, userID)
 
+	// Welcome/onboarding commands
+	case text == CmdSetWelcome:
+		a.startConfigStep(chatID, userID, msg.From.UserName, StepWelcome, MsgPromptWelcome)
+
+	case text == CmdSetRules:
+		a.startConfigStep(chatID, userID, msg.From.UserName, StepRules, MsgPromptRules)
+
+	// Analytics commands
+	case text == CmdReport:
+		a.handleReport(chatID, userID)
+
 	// Super admin commands
 	case strings.HasPrefix(text, CmdAdminSearch):
 		a.handleAdminSearch(chatID, msg.From.UserName, text)
@@ -322,6 +335,8 @@ func (a *Agent) handleSetupInput(msg *tgbotapi.Message, text string) {
 		StepTopics:          "topics",
 		StepMessageExamples: "message_examples",
 		StepChatStyle:       "chat_style",
+		StepWelcome:         "welcome_message",
+		StepRules:           "rules_text",
 	}
 
 	field, ok := fieldMap[state.Step]
@@ -569,6 +584,8 @@ func stepDisplayName(step string) string {
 		StepTopics:          "Topics",
 		StepMessageExamples: "Message Examples",
 		StepChatStyle:       "Chat Style",
+		StepWelcome:         "Welcome Message",
+		StepRules:           "Rules",
 	}
 	if name, ok := names[step]; ok {
 		return name
